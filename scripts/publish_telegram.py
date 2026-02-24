@@ -37,10 +37,10 @@ def _strip_html(text: str) -> str:
     return html.unescape(no_tags)
 
 
-def render_messages(picks_by_category, ts, max_picks=7):
+def render_messages(picks_by_category, ts, max_picks=10):
     messages = []
     for cat in ORDER:
-        picks = (picks_by_category.get(cat) or [])[:max(1, min(7, max_picks))]
+        picks = (picks_by_category.get(cat) or [])[:max(1, min(10, max_picks))]
         if not picks:
             continue
 
