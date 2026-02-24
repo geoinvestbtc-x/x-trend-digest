@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from collections import defaultdict
+import html
 import os
+import re
 import subprocess
 
 import requests
@@ -27,6 +29,12 @@ CAT_EMOJI = {
 def _html_esc(text: str) -> str:
     """Escape text for Telegram HTML parse mode."""
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def _strip_html(text: str) -> str:
+    """Convert simple HTML-formatted Telegram text to plain text for channels that don't parse HTML."""
+    no_tags = re.sub(r'<[^>]+>', '', text)
+    return html.unescape(no_tags)
 
 
 def render_messages(picks_by_category, ts, max_picks=7):
@@ -64,7 +72,7 @@ def group_picks(picks):
 
 
 def _send_via_telegram_http(text: str, target: str) -> bool:
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    token = os.getenv('TELEGRAM_DIGEST_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
     if not token:
         return False
 
@@ -92,21 +100,34 @@ def _send_via_telegram_http(text: str, target: str) -> bool:
 
 def send_messages(messages, target: str, channel: str = 'telegram'):
     sent = 0
+    # Keep HTML mode mandatory for Telegram by default (no env toggle needed).
+    require_html = True
+
     for m in messages:
         text = m['text']
 
-        if os.getenv('TELEGRAM_BOT_TOKEN'):
+        token = os.getenv('TELEGRAM_DIGEST_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
+
+        if channel == 'telegram' and require_html and not token:
+            print("[x-trend][telegram] Missing TELEGRAM_DIGEST_BOT_TOKEN/TELEGRAM_BOT_TOKEN; skip sending to avoid plain-text output")
+            continue
+
+        if token:
             print("[x-trend][telegram] Using direct Telegram Bot API path")
             if _send_via_telegram_http(text, target=target):
                 sent += 1
                 continue
+            if channel == 'telegram' and require_html:
+                print("[x-trend][telegram] HTTP send failed and TELEGRAM_REQUIRE_HTML=1; skip fallback to avoid losing bold formatting")
+                continue
 
         print(f"[x-trend][telegram] Falling back to openclaw CLI for target={target}")
+        plain_text = _strip_html(text)
         cmd = [
             'openclaw', 'message', 'send',
             '--channel', channel,
             '--target', target,
-            '--message', text,
+            '--message', plain_text,
         ]
         try:
             out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)

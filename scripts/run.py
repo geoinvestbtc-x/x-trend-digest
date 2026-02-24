@@ -305,7 +305,6 @@ def main():
     # STAGE 7: PIPELINE SUMMARY → Telegram
     # ══════════════════════════════════════════════════════════
     if os.getenv('SEND_TELEGRAM', '0') == '1' and os.getenv('TELEGRAM_TARGET') and sent_count > 0:
-        from publish_telegram import _send_via_telegram_http
         cost = usage_stats.get('cost_usd', 0)
         total_tok = usage_stats.get('total_tokens', 0)
         llm_calls = usage_stats.get('llm_calls', 0)
@@ -321,7 +320,11 @@ def main():
             f"💰 ${cost:.4f}"
         )
         print(f"  → Sending pipeline summary to Telegram...")
-        _send_via_telegram_http(summary_text, target=os.getenv('TELEGRAM_TARGET'))
+        send_messages(
+            [{'category': '__pipeline_summary__', 'text': summary_text}],
+            target=os.getenv('TELEGRAM_TARGET'),
+            channel=os.getenv('TELEGRAM_CHANNEL', 'telegram'),
+        )
 
     # ── JSON output ──
     run_payload = {
