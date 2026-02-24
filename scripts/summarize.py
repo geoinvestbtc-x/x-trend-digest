@@ -5,25 +5,36 @@ import re
 import time
 import requests
 
-MODEL = os.getenv('DIGEST_MODEL', 'openai/gpt-5-mini')
+MODEL = os.getenv('DIGEST_MODEL', 'openai/gpt-4o-mini')
 
 SYSTEM_PROMPT = (
     "Return ONLY valid minified JSON matching the provided schema. "
     "No markdown. No extra text. No reasoning.\n\n"
     "Language: ENGLISH ONLY. Do NOT translate.\n\n"
+    "You are curating a BUILDER'S DIGEST — not a news feed.\n\n"
+    "PREFER (pick these first):\n"
+    "- Real use cases: someone shares HOW they use an AI tool and what result they got\n"
+    "- Workflows & tips: practical setups, prompts, configs that worked\n"
+    "- Personal results: \"I built X with Y\", \"my agent does Z\", \"this saved me N hours\"\n"
+    "- Demos with substance: showing a real working thing, not just announcing it\n"
+    "- Unexpected discoveries: \"I found that if you do X, Y happens\"\n\n"
+    "SKIP (deprioritize or drop):\n"
+    "- Corporate announcements: \"X is now live\", \"we released Y\" (unless it includes a real demo)\n"
+    "- Product launches with no substance: just a name + link\n"
+    "- Hype without specifics: \"AI is crazy\", \"this changes everything\"\n"
+    "- Vague promo, engagement bait, giveaways\n\n"
     "TITLE:\n"
     "- Use the original tweet wording (excerpt).\n"
-    "- Keep enough context to understand what it's about.\n"
+    "- Keep enough context so the title alone tells a story.\n"
     "- Prefer a complete sentence (end with . ! ? …).\n"
     "- Remove links and trailing hashtags.\n"
-    "- Max 240 characters.\n"
-    "- Do NOT cut mid-phrase. If you must cut, end with \"…\".\n"
-    "- If the tweet is long or an article-style post, allow title up to 300 chars and end with \"…\".\n\n"
+    "- Max 240 characters (up to 300 for long/article tweets, end with \"…\").\n"
+    "- Do NOT cut mid-phrase.\n\n"
     "WHY_INTERESTING:\n"
-    "- Explain why this is interesting to a technical reader (1 short line).\n"
-    "- Focus on novelty / real results / unusual implementation / architectural implication.\n"
-    "- No advice, no tasks, no \"try this\".\n\n"
-    "If a tweet is vague/promo with no substance, SKIP it."
+    "- 1 short line: what makes this useful or surprising for a practitioner.\n"
+    "- Focus on: what they built, what result they got, what technique they used.\n"
+    "- NOT: \"this is interesting because…\" — just state the insight.\n\n"
+    "If fewer than target_picks tweets are worth picking, return fewer. Quality > quantity."
 )
 
 JSON_SCHEMA = {
@@ -133,8 +144,8 @@ def _call_llm(category, candidates, picks_n=5, attempt=0):
             {'role': 'system', 'content': SYSTEM_PROMPT},
             {'role': 'user', 'content': json.dumps(user_obj, ensure_ascii=False)}
         ],
-        'max_tokens': 8000,
-        'temperature': 0.1,
+        'max_tokens': 2000,
+        'temperature': 0,
         'response_format': {'type': 'json_object'},
     }
 
@@ -191,9 +202,9 @@ def _call_llm(category, candidates, picks_n=5, attempt=0):
     return content, call_usage
 
 
-# gpt-5-mini pricing via OpenRouter (per 1M tokens)
-_PRICE_INPUT = 0.40   # $/1M prompt tokens
-_PRICE_OUTPUT = 1.60  # $/1M completion tokens
+# gpt-4o-mini pricing via OpenRouter (per 1M tokens)
+_PRICE_INPUT = 0.15   # $/1M prompt tokens
+_PRICE_OUTPUT = 0.60  # $/1M completion tokens
 
 
 def run(items, picks_n=5):

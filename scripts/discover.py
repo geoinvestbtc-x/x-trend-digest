@@ -3,7 +3,9 @@ import os
 import random
 import time
 import requests
+import yaml
 from datetime import datetime, timezone
+from pathlib import Path
 
 API_BASE = "https://api.twitterapi.io"
 
@@ -14,7 +16,6 @@ MAX_ITEMS_PER_QUERY = int(os.getenv('DISCOVER_MAX_ITEMS', '120'))
 STOP_IF_OLDER_HOURS = int(os.getenv('DISCOVER_STOP_OLDER_H', '48'))
 
 # ── Category queries ──────────────────────────────────────────
-# Each category now has TWO queries: Top (high-engagement) and Latest (fresh)
 CATEGORY_QUERIES = {
     "AI Marketing": {
         "Top":    '("ai marketing" OR "vibe marketing" OR "marketing automation" OR "growth automation" OR "content engine") min_faves:10 lang:en -is:retweet -is:reply',
@@ -85,10 +86,6 @@ def _request_with_backoff(url, headers, params, timeout=40, retries=3):
 
 
 def _paginated_search(category: str, query: str, query_type: str, max_pages: int):
-    """
-    Paginate through twitterapi.io advanced_search.
-    Returns (all_tweets_raw, stats_dict).
-    """
     url = f"{API_BASE}/twitter/tweet/advanced_search"
     headers = _headers()
     cursor = ""
@@ -112,16 +109,12 @@ def _paginated_search(category: str, query: str, query_type: str, max_pages: int
             f"has_next={'1' if has_next else '0'} cursor_len={len(next_cursor)}"
         )
 
-        # ── stop conditions ──
-        if not has_next:
-            break
-        if not next_cursor:
+        if not has_next or not next_cursor:
             break
         if len(all_tweets) >= MAX_ITEMS_PER_QUERY:
             print(f"[x-trend][discover]   → stop: max_items ({MAX_ITEMS_PER_QUERY}) reached")
             break
 
-        # stop if most tweets on this page are outside the time window
         in_window_count = sum(1 for t in tweets if _in_window(t.get("createdAt", "")))
         if tweets and in_window_count / len(tweets) < 0.3:
             print(f"[x-trend][discover]   → stop: most tweets older than {STOP_IF_OLDER_HOURS}h "
@@ -132,7 +125,6 @@ def _paginated_search(category: str, query: str, query_type: str, max_pages: int
         if page_idx < max_pages - 1:
             _sleep(base=2.2, jitter=1.6)
 
-    # filter to time window
     kept = [t for t in all_tweets if _in_window(t.get("createdAt", ""))]
     print(
         f"[x-trend][discover] DONE cat={category} type={query_type} "
@@ -141,9 +133,20 @@ def _paginated_search(category: str, query: str, query_type: str, max_pages: int
     return kept
 
 
-def _to_candidate(category: str, tw: dict):
+def _to_candidate(category: str, tw: dict, source: str = "keyword"):
     author = tw.get("author") or {}
     entities = tw.get("entities") or {}
+
+    # Extract quoted tweet info if present
+    quoted_id = ""
+    quoted_text = ""
+    if tw.get("quoted_status_id_str"):
+        quoted_id = str(tw["quoted_status_id_str"])
+    elif tw.get("quotedTweet"):
+        qt = tw["quotedTweet"]
+        quoted_id = str(qt.get("id") or "")
+        quoted_text = qt.get("text") or ""
+
     return {
         "category": category,
         "id": str(tw.get("id") or ""),
@@ -166,11 +169,32 @@ def _to_candidate(category: str, tw: dict):
             "verified": bool(author.get("isBlueVerified") or author.get("verified")),
         },
         "entities": entities,
-        "source": "twitterapi",
+        "source": source,
+        "quoted_id": quoted_id,
+        "quoted_text": quoted_text,
     }
 
 
-def _last_tweets(username: str = "GithubProjects", limit: int = 60):
+# ── Author-based discovery ──────────────────────────────────
+
+def _load_authors() -> dict:
+    """Load data/authors.yaml → {category: [username, ...]}"""
+    root = Path(__file__).resolve().parent.parent
+    path = root / "data" / "authors.yaml"
+    if not path.exists():
+        print(f"[x-trend][discover] authors.yaml not found at {path}")
+        return {}
+    with open(path, 'r', encoding='utf-8') as f:
+        raw = yaml.safe_load(f) or {}
+    # deduplicate usernames per category
+    out = {}
+    for cat, usernames in raw.items():
+        if isinstance(usernames, list):
+            out[cat] = list(dict.fromkeys(u.lstrip('@') for u in usernames if u))
+    return out
+
+
+def _last_tweets(username: str, limit: int = 60):
     url = f"{API_BASE}/twitter/user/last_tweets"
     headers = _headers()
     params = {"userName": username}
@@ -182,14 +206,35 @@ def _last_tweets(username: str = "GithubProjects", limit: int = 60):
     return tweets[:limit]
 
 
-def run(max_pages: int = 2, only_category=None):
-    """
-    Discover candidate tweets.
+def _discover_authors(category: str, usernames: list, seen_ids: set):
+    """Fetch recent tweets from author list, return candidates in window."""
+    items = []
+    for username in usernames:
+        try:
+            tweets = _last_tweets(username, limit=30)
+            found = 0
+            for tw in tweets:
+                if not _in_window(tw.get("createdAt", "")):
+                    continue
+                tid = str(tw.get("id") or "")
+                if tid and tid in seen_ids:
+                    continue
+                seen_ids.add(tid)
+                items.append(_to_candidate(category, tw, source="author"))
+                found += 1
+            if found:
+                print(f"[x-trend][discover] author @{username} → {found} tweets in window")
+        except Exception as e:
+            print(f"[x-trend][discover] author @{username} ERROR: {e}")
+        _sleep(base=1.5, jitter=1.0)
+    return items
 
-    For each category we run TWO queries: Top (high engagement) and Latest (fresh).
-    Results are merged and returned as blocks.
-    """
+
+# ── Main entry point ─────────────────────────────────────────
+
+def run(max_pages: int = 2, only_category=None):
     out = []
+    authors_map = _load_authors()
 
     categories = list(CATEGORY_QUERIES.items())
     if only_category:
@@ -198,7 +243,10 @@ def run(max_pages: int = 2, only_category=None):
     for idx, (category, queries) in enumerate(categories):
         all_items = []
         seen_ids = set()
+        keyword_found = 0
+        author_found = 0
 
+        # ── Keyword discovery ──
         for query_type in ("Top", "Latest"):
             query = queries.get(query_type)
             if not query:
@@ -211,20 +259,29 @@ def run(max_pages: int = 2, only_category=None):
                     if tid and tid in seen_ids:
                         continue
                     seen_ids.add(tid)
-                    all_items.append(_to_candidate(category, tw))
+                    all_items.append(_to_candidate(category, tw, source="keyword"))
+                    keyword_found += 1
             except Exception as e:
                 print(f"[x-trend][discover] ERROR cat={category} type={query_type}: {e}")
-
-            # pause between Top→Latest
             _sleep(base=2.0, jitter=1.5)
+
+        # ── Author discovery ──
+        cat_authors = authors_map.get(category, [])
+        if cat_authors:
+            author_items = _discover_authors(category, cat_authors, seen_ids)
+            all_items.extend(author_items)
+            author_found = len(author_items)
+
+        merged = len(all_items)
+        print(f"[x-trend][discover] cat={category} keyword_found={keyword_found} "
+              f"author_found={author_found} merged_total={merged}")
 
         out.append({"category": category, "items": all_items, "error": None})
 
-        # pause between categories
         if idx < len(categories) - 1:
             _sleep(base=2.5, jitter=2.0)
 
-    # GitHubProjects from user timeline
+    # ── GitHubProjects from user timeline ──
     if not only_category or only_category == "GitHubProjects":
         try:
             _sleep(base=2.8, jitter=1.8)
@@ -233,7 +290,7 @@ def run(max_pages: int = 2, only_category=None):
             for tw in tweets:
                 if not _in_window(tw.get("createdAt", "")):
                     continue
-                items.append(_to_candidate("GitHubProjects", tw))
+                items.append(_to_candidate("GitHubProjects", tw, source="author"))
             out.append({"category": "GitHubProjects", "items": items, "error": None})
         except Exception as e:
             out.append({"category": "GitHubProjects", "items": [], "error": str(e)})
