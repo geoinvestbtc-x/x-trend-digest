@@ -85,8 +85,10 @@ def tg_edit_reply_markup(chat_id, message_id, reply_markup):
     r = requests.post(f'{TG_API}/editMessageReplyMarkup', json={
         'chat_id': chat_id,
         'message_id': message_id,
-        'reply_markup': json.dumps(reply_markup),
+        'reply_markup': reply_markup,
     }, timeout=10)
+    if r.status_code != 200:
+        print(f"[bot] ❌ editMessageReplyMarkup failed: {r.status_code} {r.text}")
     return r.status_code == 200
 
 
