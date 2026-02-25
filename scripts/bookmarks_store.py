@@ -63,6 +63,19 @@ def save(tweet_id: str, url: str = '', title: str = '', category: str = '',
     return rec
 
 
+def remove(tweet_id: str) -> bool:
+    """Remove a bookmark entry."""
+    records = _load_all()
+    filtered = [r for r in records if r.get('tweet_id') != tweet_id]
+    if len(filtered) == len(records):
+        return False
+    BOOKMARKS_FILE.write_text(
+        '\n'.join(json.dumps(x, ensure_ascii=False) for x in filtered) + ('\n' if filtered else ''),
+        encoding='utf-8',
+    )
+    return True
+
+
 def mark_deep_read_sent(tweet_id: str):
     """Mark a bookmark as having had its deep-read sent."""
     records = _load_all()

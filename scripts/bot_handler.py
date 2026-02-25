@@ -50,7 +50,7 @@ def _load_env():
 _load_env()
 
 sys.path.insert(0, str(ROOT / 'scripts'))
-from bookmarks_store import save as bk_save, exists as bk_exists
+from bookmarks_store import save as bk_save, exists as bk_exists, remove as bk_remove
 
 # ── Config ────────────────────────────────────────────────────
 
@@ -92,8 +92,8 @@ def tg_edit_reply_markup(chat_id, message_id, reply_markup):
     return r.status_code == 200
 
 
-def _update_keyboard_activate(existing_markup, activated_tweet_id):
-    """Clone keyboard, replace 🪨 with 🔥 for the activated tweet."""
+def _update_keyboard_toggle(existing_markup, activated_tweet_id, activate: bool):
+    """Clone keyboard, toggle 🪨↔🔥 for the activated tweet."""
     if not existing_markup:
         return None
     new_rows = []
@@ -103,7 +103,10 @@ def _update_keyboard_activate(existing_markup, activated_tweet_id):
             cb = btn.get('callback_data', '')
             text = btn.get('text', '')
             if cb == f'interesting:{activated_tweet_id}':
-                text = text.replace('🪨', '🔥')
+                if activate:
+                    text = text.replace('🪨', '🔥')
+                else:
+                    text = text.replace('🔥', '🪨')
             new_row.append({'text': text, 'callback_data': cb})
         new_rows.append(new_row)
     return {'inline_keyboard': new_rows}
@@ -142,9 +145,16 @@ def handle_interesting(callback_query):
     chat_id = message.get('chat', {}).get('id')
     message_id = message.get('message_id')
 
-    # Already saved?
     if bk_exists(tweet_id):
-        tg_answer_callback(cq_id, text='🔥 Already saved!')
+        # Already saved? -> UNDO
+        bk_remove(tweet_id)
+        existing_markup = message.get('reply_markup')
+        if existing_markup and message_id:
+            new_markup = _update_keyboard_toggle(existing_markup, tweet_id, activate=False)
+            if new_markup:
+                tg_edit_reply_markup(chat_id, message_id, new_markup)
+        tg_answer_callback(cq_id, text='🪨 Removed!')
+        print(f"[bot] 🪨 Removed tweet {tweet_id}")
         return
 
     # Extract info from message
@@ -160,7 +170,7 @@ def handle_interesting(callback_query):
     # Update keyboard: 🪨 → 🔥
     existing_markup = message.get('reply_markup')
     if existing_markup and message_id:
-        new_markup = _update_keyboard_activate(existing_markup, tweet_id)
+        new_markup = _update_keyboard_toggle(existing_markup, tweet_id, activate=True)
         if new_markup:
             tg_edit_reply_markup(chat_id, message_id, new_markup)
 
