@@ -54,4 +54,35 @@ python3 skills/x-trend-digest/scripts/run.py
 3. `rank.py` — relevance/quality scoring
 4. `summarize.py` — short RU summaries via OpenRouter nano
 5. `memory_store.py` — dedup + TTL cleanup
-6. `publish_telegram.py` — Telegram-ready text
+6. `publish_telegram.py` — Telegram-ready text with 🪨 Interesting buttons
+
+## 🔥 Interesting / Weekly Digest
+
+Each digest tweet in Telegram has numbered 🪨 buttons. Press a button to:
+1. Toggle it to 🔥 (visual feedback)
+2. Save tweet to `data/bookmarks.jsonl`
+
+On Saturday (or manually), run `weekly_digest.py` to:
+1. Collect all 🔥 tweets from the past 7 days
+2. Fetch full tweet + top replies + linked articles
+3. LLM deep analysis per category (tools, approaches, ideas)
+4. Send formatted weekly digest to Telegram
+
+### Run bot handler (persistent process)
+```bash
+python3 scripts/bot_handler.py
+```
+
+### Run weekly digest (cron on Saturday or manual)
+```bash
+python3 scripts/weekly_digest.py
+```
+
+### Files
+- `bot_handler.py` — long-polling Telegram callback handler (save only)
+- `weekly_digest.py` — batch deep analysis of saved tweets
+- `bookmarks_store.py` — JSONL storage for interesting tweets
+- `data/bookmarks.jsonl` — bookmark records
+
+### Optional env
+- `WEEKLY_DIGEST_MODEL=openai/gpt-4o` (LLM for weekly analysis)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from collections import defaultdict
 import html
+import json
 import os
 import re
 import subprocess
@@ -38,6 +39,11 @@ def _strip_html(text: str) -> str:
 
 
 def render_messages(picks_by_category, ts, max_picks=10):
+    """Render one message per category with numbered picks.
+
+    Each message carries a `picks_data` list so that send_messages
+    can attach inline 🪨 buttons.
+    """
     messages = []
     for cat in ORDER:
         picks = (picks_by_category.get(cat) or [])[:max(1, min(10, max_picks))]
@@ -47,21 +53,54 @@ def render_messages(picks_by_category, ts, max_picks=10):
         emoji = CAT_EMOJI.get(cat, '🔹')
         lines = [f'{emoji} <b>{_html_esc(cat)}</b> — last 48h']
 
+        picks_data = []  # [{index, tweet_id}, ...]
         for i, p in enumerate(picks):
             title = _html_esc((p.get('title', '').strip() or '(no title)')[:300])
             why = _html_esc(p.get('why_interesting', '').strip() or '')
             url = p.get('url', '').strip()
+            tweet_id = str(p.get('id', ''))
 
             lines.append('')  # blank line before item
-            lines.append(f'<b>{title}</b>')
+            lines.append(f'<b>{i + 1}. {title}</b>')
             if why:
                 lines.append(f'Why: {why}')
             if url:
                 lines.append(url)
             lines.append('')  # blank line after item
 
-        messages.append({'category': cat, 'text': '\n'.join(lines)})
+            picks_data.append({'index': i + 1, 'tweet_id': tweet_id})
+
+        messages.append({
+            'category': cat,
+            'text': '\n'.join(lines),
+            'picks_data': picks_data,
+        })
     return messages
+
+
+def _build_interesting_keyboard(picks_data, activated=None):
+    """Build InlineKeyboardMarkup with 🪨/🔥 buttons.
+
+    picks_data: [{'index': 1, 'tweet_id': '123'}, ...]
+    activated: set of tweet_ids that have been clicked (shown as 🔥)
+    """
+    activated = activated or set()
+    buttons = []
+    for pd in picks_data:
+        idx = pd['index']
+        tid = pd['tweet_id']
+        emoji = '🔥' if tid in activated else '🪨'
+        buttons.append({
+            'text': f'{emoji} {idx}',
+            'callback_data': f'interesting:{tid}',
+        })
+
+    # Split into rows of 5 max
+    rows = []
+    for i in range(0, len(buttons), 5):
+        rows.append(buttons[i:i + 5])
+
+    return {'inline_keyboard': rows}
 
 
 def group_picks(picks):
@@ -71,7 +110,7 @@ def group_picks(picks):
     return by
 
 
-def _send_via_telegram_http(text: str, target: str) -> bool:
+def _send_via_telegram_http(text: str, target: str, reply_markup=None) -> bool:
     token = os.getenv('TELEGRAM_DIGEST_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
     if not token:
         return False
@@ -82,8 +121,11 @@ def _send_via_telegram_http(text: str, target: str) -> bool:
         'parse_mode': 'HTML',
         'disable_web_page_preview': True,
     }
+    if reply_markup:
+        payload['reply_markup'] = json.dumps(reply_markup)
+
     try:
-        print(f"[x-trend][telegram] HTTP send -> chat={target}, len={len(text)}")
+        print(f"[x-trend][telegram] HTTP send -> chat={target}, len={len(text)}, has_buttons={'yes' if reply_markup else 'no'}")
         r = requests.post(
             f'https://api.telegram.org/bot{token}/sendMessage',
             json=payload,
@@ -105,6 +147,7 @@ def send_messages(messages, target: str, channel: str = 'telegram'):
 
     for m in messages:
         text = m['text']
+        picks_data = m.get('picks_data', [])
 
         token = os.getenv('TELEGRAM_DIGEST_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
 
@@ -112,9 +155,14 @@ def send_messages(messages, target: str, channel: str = 'telegram'):
             print("[x-trend][telegram] Missing TELEGRAM_DIGEST_BOT_TOKEN/TELEGRAM_BOT_TOKEN; skip sending to avoid plain-text output")
             continue
 
+        # Build inline keyboard if we have picks_data
+        reply_markup = None
+        if picks_data:
+            reply_markup = _build_interesting_keyboard(picks_data)
+
         if token:
             print("[x-trend][telegram] Using direct Telegram Bot API path")
-            if _send_via_telegram_http(text, target=target):
+            if _send_via_telegram_http(text, target=target, reply_markup=reply_markup):
                 sent += 1
                 continue
             if channel == 'telegram' and require_html:
