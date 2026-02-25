@@ -13,6 +13,7 @@ ORDER = [
     'AI Coding',
     'AI Design',
     'General AI',
+    'AI Business',
     'OpenClaw',
     'GitHubProjects',
 ]
@@ -22,6 +23,7 @@ CAT_EMOJI = {
     'AI Coding':      '⚡',
     'AI Design':      '🎨',
     'General AI':     '🧠',
+    'AI Business':    '💰',
     'OpenClaw':       '🦞',
     'GitHubProjects': '🐙',
 }

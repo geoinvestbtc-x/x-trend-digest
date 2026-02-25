@@ -35,6 +35,7 @@ Run a daily pipeline (manual or cron):
 - AI Coding
 - AI Design
 - General AI
+- AI Business
 - GitHub Projects (from `https://x.com/GithubProjects`)
 
 ## Run (manual)

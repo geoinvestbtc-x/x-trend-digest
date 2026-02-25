@@ -11,6 +11,14 @@ BLACKLIST = {
     'airdrop', 'giveaway', 'copytrade',
     'i am building an ai applied to marketing tech startup',
     'outside consultant',
+    # AI business spam
+    'dm me', 'link in bio', 'free course', 'free ebook',
+    'get rich', 'passive income guaranteed', '10x your income',
+    'drop a', 'comment below', 'retweet to win',
+    'crypto trading bot', 'forex', 'binary option',
+    'dropshipping', 'print on demand',
+    'follow me for', 'follow for follow',
+    'limited spots', 'spots remaining', 'enroll now',
 }
 
 

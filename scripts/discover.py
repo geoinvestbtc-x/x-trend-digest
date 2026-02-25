@@ -33,6 +33,10 @@ CATEGORY_QUERIES = {
         "Top":    '("new ai tool" OR "ai release" OR "open source ai" OR "ai agents" OR llm OR "paper") min_faves:10 lang:en -is:retweet -is:reply',
         "Latest": '("new ai tool" OR "ai release" OR "open source ai" OR "ai agents" OR llm OR "paper") min_faves:3 lang:en -is:retweet -is:reply',
     },
+    "AI Business": {
+        "Top":    '("made" OR "earned" OR "built" OR "revenue" OR "profit" OR "MRR" OR "ARR" OR "side hustle" OR "monetize" OR "income" OR "saas") ("with ai" OR "using ai" OR "ai tool" OR "gpt" OR "claude" OR "chatgpt" OR "automation") min_faves:15 lang:en -is:retweet -is:reply',
+        "Latest": '("made" OR "earned" OR "built" OR "revenue" OR "launched" OR "customers" OR "paying" OR "business" OR "freelance") ("with ai" OR "using ai" OR "ai tool" OR "ai agent" OR "ai workflow" OR "ai automation") min_faves:5 lang:en -is:retweet -is:reply',
+    },
     "OpenClaw": {
         "Top":    '(openclaw OR "open claw") (marketing OR growth OR automation OR mcp OR workflow OR agent) lang:en -is:retweet',
         "Latest": '(openclaw OR "open claw") (marketing OR growth OR automation OR mcp OR workflow OR agent) lang:en -is:retweet',

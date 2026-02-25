@@ -68,11 +68,12 @@ CAT_EMOJI = {
     'AI Coding':      '⚡',
     'AI Design':      '🎨',
     'General AI':     '🧠',
+    'AI Business':    '💰',
     'OpenClaw':       '🦞',
     'GitHubProjects': '🐙',
 }
 
-CAT_ORDER = ['AI Marketing', 'AI Coding', 'AI Design', 'General AI', 'OpenClaw', 'GitHubProjects']
+CAT_ORDER = ['AI Marketing', 'AI Coding', 'AI Design', 'General AI', 'AI Business', 'OpenClaw', 'GitHubProjects']
 
 
 # ── Twitter API ───────────────────────────────────────────────
