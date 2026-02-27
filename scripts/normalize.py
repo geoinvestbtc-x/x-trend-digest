@@ -47,10 +47,11 @@ def text_hash(text: str) -> str:
 
 
 def key_for(item: dict) -> str:
-    # X tweet id is strongest key
     tid = item.get("id")
     if tid:
-        return f"tweet:{tid}"
+        # Use platform-specific prefix so Reddit post IDs don't collide with tweet IDs
+        prefix = "post" if item.get("platform") == "reddit" else "tweet"
+        return f"{prefix}:{tid}"
     u = canonical_url(item.get("url", ""))
     return "url:" + hashlib.sha256(u.encode()).hexdigest()[:16]
 

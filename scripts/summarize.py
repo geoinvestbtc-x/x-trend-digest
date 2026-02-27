@@ -7,6 +7,17 @@ import requests
 
 MODEL = os.getenv('DIGEST_MODEL', 'openai/gpt-4o-mini')
 
+# Per-category framing injected into user context so LLM curates with intent
+CATEGORY_CONTEXT = {
+    'AI Marketing':   'Focus on AI-powered marketing tools, growth tactics, automation workflows, and content strategies used by real practitioners.',
+    'AI Coding':      'Focus on AI coding tools, LLM integrations, agent frameworks, developer workflows, and hands-on engineering with AI.',
+    'AI Design':      'Focus on AI-assisted design tools, UI/UX workflows, generative design, Figma plugins, and creative AI applications.',
+    'General AI':     'Focus on AI research breakthroughs, new model releases, technical insights, benchmarks, and significant industry developments.',
+    'AI Business':    'Focus on AI startup strategies, SaaS building with AI, indie hacker workflows, revenue milestones, and concrete business outcomes.',
+    'OpenClaw':       'Focus on OpenClaw product insights, feature discussions, developer experience, and community feedback.',
+    'GitHubProjects': 'Focus on new open-source AI projects, novel libraries, interesting repos — preference for projects with working demos or clear practical value.',
+}
+
 SYSTEM_PROMPT = (
     "Return ONLY valid minified JSON matching the provided schema. "
     "No markdown. No extra text. No reasoning.\n\n"
@@ -127,6 +138,7 @@ def _call_llm(category, candidates, picks_n=5, attempt=0):
 
     user_obj = {
         'category': category,
+        'category_context': CATEGORY_CONTEXT.get(category, ''),
         'target_picks': picks_n,
         'candidates': compact,
         'json_schema': JSON_SCHEMA,
@@ -145,7 +157,7 @@ def _call_llm(category, candidates, picks_n=5, attempt=0):
             {'role': 'user', 'content': json.dumps(user_obj, ensure_ascii=False)}
         ],
         'max_tokens': 2000,
-        'temperature': 0,
+        'temperature': 0.25,
         'response_format': {'type': 'json_object'},
     }
 
@@ -222,7 +234,7 @@ def run(items, picks_n=5):
 
     for category, arr in by.items():
         arr.sort(key=lambda x: x.get('score', 0), reverse=True)
-        arr = arr[:10]
+        arr = arr[:15]
         effective_picks_n = min(picks_n, len(arr))
 
         raw = ""

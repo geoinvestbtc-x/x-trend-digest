@@ -4,8 +4,11 @@ Trend-aware ranker: velocity × relative engagement × virality.
 Not a "popularity" ranker — a "what's trending NOW" ranker.
 """
 import math
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
+
+REDDIT_MIN_RANK_SCORE = int(os.getenv('REDDIT_MIN_RANK_SCORE', '50'))
 
 BLACKLIST = {
     'airdrop', 'giveaway', 'copytrade',
@@ -38,12 +41,12 @@ def _hours_since(created_at: str) -> float:
 
 
 def _raw_engagement(m: dict) -> float:
-    """Weighted engagement: bookmarks are most valuable."""
+    """Weighted engagement: bookmarks are most valuable (intent to return > passive like)."""
     b = float(m.get('bookmark', 0) or 0)
     rt = float(m.get('retweet', 0) or 0)
     rp = float(m.get('reply', 0) or 0)
     lk = float(m.get('like', 0) or 0)
-    return 6*b + 3*rt + 2*rp + 1*lk
+    return 10*b + 3*rt + 2*rp + 1*lk
 
 
 def score(it: dict) -> dict:
@@ -73,21 +76,14 @@ def score(it: dict) -> dict:
     retweets = float(m.get('retweet', 0) or 0)
     virality = retweets / (likes + 1)
 
-    # Freshness: time decay
-    if hours <= 12:
-        freshness = 1.0
-    elif hours <= 24:
-        freshness = 0.9
-    elif hours <= 36:
-        freshness = 0.8
-    else:
-        freshness = 0.65
+    # Freshness: smooth exponential decay (1.0 at 0h → ~0.86 at 12h → ~0.74 at 24h → ~0.64 at 36h → ~0.57 at 48h)
+    freshness = math.exp(-0.0125 * hours)
 
     # Author boost for author-sourced tweets
     source_boost = 1.15 if it.get('source') == 'author' else 1.0
 
-    # Combined score: weighted blend
-    total = (velocity * 2.0 + relative * 1.0 + virality * 5.0) * freshness * source_boost
+    # Combined score: quality-biased blend (reduced virality weight to avoid low-substance viral bait)
+    total = (velocity * 2.5 + relative * 2.0 + virality * 1.5) * freshness * source_boost
 
     components = {
         'velocity': round(velocity, 3),
@@ -120,8 +116,13 @@ def _classify_reject(it):
     bookmarks = int(m.get('bookmark', 0) or 0)
     retweets = int(m.get('retweet', 0) or 0)
 
+    # Reddit posts: gate on upvotes (no bookmarks/retweets on Reddit)
+    if it.get('platform') == 'reddit':
+        likes = int(m.get('like', 0) or 0)
+        if likes < REDDIT_MIN_RANK_SCORE:
+            return False, 'low_eng'
     # Softer gate: author-sourced tweets get a pass even with low engagement
-    if it.get('source') == 'author':
+    elif it.get('source') == 'author':
         # author tweets only need minimal engagement
         if bookmarks < 1 and retweets < 1 and int(m.get('like', 0) or 0) < 3:
             return False, 'low_eng'

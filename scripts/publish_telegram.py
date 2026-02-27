@@ -40,40 +40,81 @@ def _strip_html(text: str) -> str:
     return html.unescape(no_tags)
 
 
-def render_messages(picks_by_category, ts, max_picks=10):
+def _fmt_number(n: int) -> str:
+    """Format a large number compactly: 4500 → 4.5k."""
+    if n >= 1000:
+        return f'{n / 1000:.1f}'.rstrip('0').rstrip('.') + 'k'
+    return str(n)
+
+
+def render_messages(picks_by_category, ts, max_picks=10, source='twitter'):
     """Render one message per category with numbered picks.
 
+    source: 'twitter' or 'reddit' — controls header badge and item format.
     Each message carries a `picks_data` list so that send_messages
     can attach inline 🪨 buttons.
     """
+    source_badge = '🟠 Reddit' if source == 'reddit' else '𝕏'
     messages = []
+
     for cat in ORDER:
         picks = (picks_by_category.get(cat) or [])[:max(1, min(10, max_picks))]
         if not picks:
             continue
 
         emoji = CAT_EMOJI.get(cat, '🔹')
-        lines = [f'{emoji} <b>{_html_esc(cat)}</b> — last 48h']
+        lines = [f'{emoji} <b>{_html_esc(cat)}</b> · {source_badge} — last 48h']
 
-        picks_data = []  # [{index, tweet_id}, ...]
+        picks_data = []
         for i, p in enumerate(picks):
             title = _html_esc((p.get('title', '').strip() or '(no title)')[:300])
             why = _html_esc(p.get('why_interesting', '').strip() or '')
             url = p.get('url', '').strip()
-            tweet_id = str(p.get('id', ''))
+            item_id = str(p.get('id', ''))
 
-            lines.append('')  # blank line before item
+            lines.append('')
             lines.append(f'<b>{i + 1}. {title}</b>')
             if why:
                 lines.append(f'Why: {why}')
-            if url:
-                lines.append(url)
-            lines.append('')  # blank line after item
 
-            picks_data.append({'index': i + 1, 'tweet_id': tweet_id})
+            if source == 'reddit':
+                # Stats line: upvotes · comments · subreddit
+                dm = p.get('display_metrics', {})
+                upvotes = dm.get('upvotes', 0)
+                comments = dm.get('comments', 0)
+                subreddit = (p.get('entities') or {}).get('subreddit', '')
+                stats_parts = []
+                if upvotes:
+                    stats_parts.append(f'⬆️ {_fmt_number(upvotes)}')
+                if comments:
+                    stats_parts.append(f'💬 {_fmt_number(comments)}')
+                if subreddit:
+                    stats_parts.append(f'r/{subreddit}')
+                if stats_parts:
+                    lines.append(' · '.join(stats_parts))
+
+                if url:
+                    lines.append(url)
+
+                # External article link for link posts
+                ext_url = (p.get('entities') or {}).get('external_url', '')
+                if ext_url:
+                    lines.append(f'🔗 {ext_url}')
+
+                # Button callback uses reddit: prefix
+                callback_key = f'reddit:{item_id}'
+            else:
+                if url:
+                    lines.append(url)
+                callback_key = item_id
+
+            lines.append('')
+
+            picks_data.append({'index': i + 1, 'tweet_id': callback_key})
 
         messages.append({
             'category': cat,
+            'source': source,
             'text': '\n'.join(lines),
             'picks_data': picks_data,
         })

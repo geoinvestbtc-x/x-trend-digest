@@ -47,14 +47,15 @@ def exists(tweet_id: str) -> bool:
 
 
 def save(tweet_id: str, url: str = '', title: str = '', category: str = '',
-         deep_read_sent: bool = False):
-    """Save a bookmark entry."""
+         source: str = 'twitter', deep_read_sent: bool = False):
+    """Save a bookmark entry. source is 'twitter' or 'reddit'."""
     BOOKMARKS_FILE.parent.mkdir(parents=True, exist_ok=True)
     rec = {
         'tweet_id': tweet_id,
         'url': url,
         'title': title,
         'category': category,
+        'source': source,
         'saved_at': datetime.now(timezone.utc).isoformat(),
         'deep_read_sent': deep_read_sent,
     }

@@ -11,6 +11,7 @@ Each record: {"key": "tweet:123", "category": "AI Coding", "tier": "pick", "seen
 """
 import json
 import os
+import fcntl
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -93,21 +94,26 @@ def append(items, tier='pick'):
     """
     Append items to memory with given tier.
     tier should be "pick" or "ranked".
+    Uses exclusive file lock to prevent concurrent write corruption.
     """
     MEM.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
     with MEM.open('a', encoding='utf-8') as f:
-        for p in items:
-            key = p.get('key') or (f"tweet:{p.get('id')}" if p.get('id') else '')
-            if not key:
-                continue
-            rec = {
-                'key': key,
-                'category': p.get('category', ''),
-                'tier': tier,
-                'seen_at': now,
-            }
-            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            for p in items:
+                key = p.get('key') or (f"tweet:{p.get('id')}" if p.get('id') else '')
+                if not key:
+                    continue
+                rec = {
+                    'key': key,
+                    'category': p.get('category', ''),
+                    'tier': tier,
+                    'seen_at': now,
+                }
+                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def cleanup(days=None):
@@ -135,10 +141,13 @@ def cleanup(days=None):
         else:
             removed += 1
 
-    MEM.write_text(
-        '\n'.join(json.dumps(x, ensure_ascii=False) for x in kept) + ('\n' if kept else ''),
-        encoding='utf-8',
-    )
+    content = '\n'.join(json.dumps(x, ensure_ascii=False) for x in kept) + ('\n' if kept else '')
+    with MEM.open('w', encoding='utf-8') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(content)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
     return removed
 
 

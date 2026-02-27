@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import os
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +53,15 @@ def _mask(val: str, show_start=4, show_end=4) -> str:
 
 
 def main():
+    parser = argparse.ArgumentParser(description='X Trend Digest pipeline')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Run full pipeline (discover→rank→summarize) but skip Telegram send and memory writes')
+    parser.add_argument('--no-reddit', action='store_true',
+                        help='Skip Reddit discovery even if REDDIT_DISCOVER_ENABLED=1')
+    args = parser.parse_args()
+    dry_run = args.dry_run
+    skip_reddit = args.no_reddit
+
     load_env()
     ts = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')
     day = datetime.now(timezone.utc).strftime('%Y%m%d')
@@ -71,6 +82,8 @@ def main():
     print(f"[STAGE 0] CONFIG")
     print(f"{'='*60}")
     print(f"  ts             : {ts}")
+    if dry_run:
+        print(f"  *** DRY RUN — no Telegram send, no memory writes ***")
     print(f"  ROOT           : {ROOT}")
     print(f"  picks_n        : {picks_n}")
     print(f"  memory_days    : {memory_days}")
@@ -81,6 +94,8 @@ def main():
     print(f"  OPENROUTER_KEY : {_mask(os.getenv('OPENROUTER_API_KEY', ''))}")
     print(f"  TWITTERAPI_KEY : {_mask(os.getenv('TWITTERAPI_IO_KEY', ''))}")
     print(f"  TELEGRAM_TOKEN : {_mask(os.getenv('TELEGRAM_BOT_TOKEN', ''))}")
+    reddit_enabled = os.getenv('REDDIT_DISCOVER_ENABLED', '0') == '1' and not skip_reddit
+    print(f"  REDDIT         : {'enabled' if reddit_enabled else 'disabled (set REDDIT_DISCOVER_ENABLED=1 to enable)'}")
     print(f"{'='*60}\n")
 
     # ══════════════════════════════════════════════════════════
@@ -205,11 +220,129 @@ def main():
             r_copy['key'] = r_copy.get('key') or (f"tweet:{rid}" if rid else '')
             ranked_not_picked.append(r_copy)
 
-    # Save to memory
-    mem_append(picks, tier='pick')
-    mem_append(ranked_not_picked, tier='ranked')
-    mem_cleanup(memory_days)
-    print(f"  [STAGE 5] Memory: saved {len(picks)} picks + {len(ranked_not_picked)} ranked")
+    # Save to memory (skipped in dry-run)
+    if dry_run:
+        print(f"  [STAGE 5] Memory: DRY RUN — skipping write ({len(picks)} picks + {len(ranked_not_picked)} ranked)")
+    else:
+        mem_append(picks, tier='pick')
+        mem_append(ranked_not_picked, tier='ranked')
+        mem_cleanup(memory_days)
+        print(f"  [STAGE 5] Memory: saved {len(picks)} picks + {len(ranked_not_picked)} ranked")
+
+    # ══════════════════════════════════════════════════════════
+    # STAGE 5b: REDDIT PIPELINE (optional, parallel data flow)
+    # ══════════════════════════════════════════════════════════
+    reddit_picks = []
+    reddit_usage_stats = {}
+
+    if reddit_enabled:
+        print(f"{'='*60}")
+        print(f"[STAGE 5b] REDDIT PIPELINE")
+        print(f"{'='*60}")
+        try:
+            import reddit_discover
+            from reddit_discover import run as reddit_discover_run
+
+            r_blocks = reddit_discover_run(only_category=only_cat or None)
+            for b in r_blocks:
+                cat = b.get('category', '?')
+                status = f"✅ {len(b.get('items', []))} posts" if not b.get('error') else f"❌ {b['error']}"
+                print(f"  [Reddit/{cat}] {status}")
+
+            r_normalized = normalize_run(r_blocks)
+            print(f"  Reddit normalized: {len(r_normalized)}")
+
+            r_fresh = filter_new(r_normalized, days=memory_days)
+            print(f"  Reddit after TTL dedup: {len(r_fresh)}")
+
+            # cross-dedup within Reddit batch
+            r_dedup = {}
+            for it in r_fresh:
+                k = it.get('key') or it.get('id')
+                if k and k not in r_dedup:
+                    r_dedup[k] = it
+            r_fresh = list(r_dedup.values())
+
+            r_ranked = rank_run(r_fresh, max_candidates_per_category=25)
+            print(f"  Reddit ranked: {len(r_ranked)}")
+
+            # ── Enrich top candidates with top comments before LLM ──
+            fetch_comments = os.getenv('REDDIT_FETCH_COMMENTS', '1') == '1'
+            n_top_comments = int(os.getenv('REDDIT_TOP_COMMENTS', '5'))
+            if fetch_comments and r_ranked:
+                from concurrent.futures import ThreadPoolExecutor
+                import threading
+                _rate_lock = threading.Semaphore(3)  # max 3 concurrent requests
+
+                # Only enrich top 10 per category (those most likely to reach LLM)
+                from collections import defaultdict as _dd
+                _cat_seen = _dd(int)
+                _to_enrich, _skip_enrich = [], []
+                for _item in r_ranked:
+                    _cat = _item.get('category', '?')
+                    if _cat_seen[_cat] < 10:
+                        _to_enrich.append(_item)
+                        _cat_seen[_cat] += 1
+                    else:
+                        _skip_enrich.append(_item)
+
+                def _enrich_with_comments(item):
+                    pid = str(item.get('id', ''))
+                    sr = (item.get('entities') or {}).get('subreddit', '')
+                    if not pid or not sr:
+                        return item
+                    with _rate_lock:
+                        comments = reddit_discover.fetch_top_comments(pid, sr, limit=n_top_comments)
+                        time.sleep(0.4)
+                    if not comments:
+                        return item
+                    item = dict(item)
+                    comments_block = '\n\nTop comments:\n' + '\n'.join(
+                        f"[⬆️{c['score']}] {c['text']}" for c in comments
+                    )
+                    item['text'] = (item.get('text') or '') + comments_block
+                    return item
+
+                print(f"  Fetching comments for {len(_to_enrich)} Reddit candidates...")
+                with ThreadPoolExecutor(max_workers=3) as _pool:
+                    _enriched = list(_pool.map(_enrich_with_comments, _to_enrich))
+                r_ranked = _enriched + _skip_enrich
+                print(f"  Comment enrichment done")
+
+            if r_ranked:
+                reddit_picks, reddit_usage_stats = summarize_run(r_ranked, picks_n=picks_n)
+                print(f"  Reddit picks: {len(reddit_picks)}")
+                print(f"  Reddit LLM: {reddit_usage_stats}")
+
+                # Enrich Reddit picks with display metadata (subreddit, upvotes, comment count)
+                r_ranked_idx = {str(r.get('id')): r for r in r_ranked}
+                for p in reddit_picks:
+                    base = r_ranked_idx.get(str(p.get('id')), {})
+                    p['platform'] = 'reddit'
+                    p['entities'] = base.get('entities', {})
+                    raw_comments = base.get('metrics', {}).get('reply', 0)
+                    p['display_metrics'] = {
+                        'upvotes': base.get('metrics', {}).get('like', 0),
+                        'comments': raw_comments * 5,  # restore actual count (was scaled /5)
+                    }
+
+                if not dry_run:
+                    r_pick_ids = {str(p.get('id')) for p in reddit_picks}
+                    mem_append(reddit_picks, tier='pick')
+                    mem_append(
+                        [r for r in r_ranked if str(r.get('id')) not in r_pick_ids],
+                        tier='ranked'
+                    )
+                    print(f"  Reddit memory: saved {len(reddit_picks)} picks")
+            else:
+                print(f"  Reddit: 0 ranked candidates, skipping LLM")
+
+        except Exception as e:
+            import traceback
+            print(f"  [Reddit] ❌ Pipeline error: {e}")
+            traceback.print_exc()
+
+        print(f"{'='*60}\n")
 
     # ══════════════════════════════════════════════════════════
     # STAGE 6: PUBLISH
@@ -218,10 +351,15 @@ def main():
     print(f"[STAGE 6] PUBLISH")
     print(f"{'='*60}")
 
-    by_cat = group_picks(picks)
-    messages = render_messages(by_cat, ts, max_picks=min(7, picks_n))
-    print(f"  picks total    : {len(picks)}")
-    print(f"  messages built : {len(messages)}")
+    # Twitter messages first, then Reddit messages
+    twitter_by_cat = group_picks(picks)
+    reddit_by_cat = group_picks(reddit_picks)
+    twitter_messages = render_messages(twitter_by_cat, ts, max_picks=min(7, picks_n), source='twitter')
+    reddit_messages = render_messages(reddit_by_cat, ts, max_picks=min(7, picks_n), source='reddit') if reddit_picks else []
+    messages = twitter_messages + reddit_messages
+    print(f"  X picks        : {len(picks)}")
+    print(f"  Reddit picks   : {len(reddit_picks)}")
+    print(f"  messages built : {len(messages)} ({len(twitter_messages)} X + {len(reddit_messages)} Reddit)")
     for m in messages:
         cat = m.get('category', '')
         print(f"  [{cat}] {len(m.get('text',''))} chars")
@@ -248,7 +386,9 @@ def main():
     tg_txt.write_text('\n\n'.join([m['text'] for m in messages]), encoding='utf-8')
 
     sent_count = 0
-    if os.getenv('SEND_TELEGRAM', '0') == '1' and os.getenv('TELEGRAM_TARGET'):
+    if dry_run:
+        print(f"  Telegram skipped (DRY RUN)")
+    elif os.getenv('SEND_TELEGRAM', '0') == '1' and os.getenv('TELEGRAM_TARGET'):
         if not messages:
             print(f"  ⚠ SEND_TELEGRAM=1, но 0 сообщений.")
         else:
@@ -304,7 +444,7 @@ def main():
     # ══════════════════════════════════════════════════════════
     # STAGE 7: PIPELINE SUMMARY → Telegram
     # ══════════════════════════════════════════════════════════
-    if os.getenv('SEND_TELEGRAM', '0') == '1' and os.getenv('TELEGRAM_TARGET') and sent_count > 0:
+    if not dry_run and os.getenv('SEND_TELEGRAM', '0') == '1' and os.getenv('TELEGRAM_TARGET') and sent_count > 0:
         cost = usage_stats.get('cost_usd', 0)
         total_tok = usage_stats.get('total_tokens', 0)
         llm_calls = usage_stats.get('llm_calls', 0)
@@ -312,10 +452,13 @@ def main():
         if usage_stats.get('completion_tokens', 0) > 0:
             reasoning_pct = int(usage_stats.get('reasoning_tokens', 0) / usage_stats['completion_tokens'] * 100)
 
+        reddit_line = f"🟠 Reddit: {len(reddit_picks)} picks\n" if reddit_picks else ""
         summary_text = (
             f"✅ <b>Pipeline complete</b>\n"
             f"\n"
-            f"📊 {totals['discovered']} discovered → {totals['after_rank']} ranked → {totals['picks']} picks → {sent_count} sent\n"
+            f"𝕏 {totals['discovered']} discovered → {totals['after_rank']} ranked → {totals['picks']} picks\n"
+            f"{reddit_line}"
+            f"📨 {sent_count} messages sent\n"
             f"🤖 {llm_calls} LLM calls · {total_tok:,} tokens (reasoning {reasoning_pct}%)\n"
             f"💰 ${cost:.4f}"
         )

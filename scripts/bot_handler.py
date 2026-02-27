@@ -114,20 +114,37 @@ def _update_keyboard_toggle(existing_markup, activated_tweet_id, activate: bool)
 
 # ── Callback handler ─────────────────────────────────────────
 
-def _extract_tweet_info_from_message(message: dict, tweet_id: str) -> dict:
-    """Try to extract tweet URL and title from the Telegram message text."""
+import re as _re
+_KNOWN_CATS = ['AI Marketing', 'AI Coding', 'AI Design', 'General AI',
+               'AI Business', 'OpenClaw', 'GitHubProjects']
+
+
+def _extract_item_info_from_message(message: dict, item_key: str, platform: str) -> dict:
+    """Extract URL and category from the Telegram message text.
+
+    item_key: for Twitter = tweet_id, for Reddit = 'reddit:{post_id}'
+    platform: 'twitter' or 'reddit'
+    """
     text = message.get('text', '')
     url = ''
-    title = ''
-    # Find URL containing the tweet_id
-    import re
-    for m in re.finditer(r'https?://x\.com/\S+/status/' + re.escape(tweet_id), text):
-        url = m.group(0)
-        break
-    # Find category from first line
+
+    if platform == 'reddit':
+        post_id = item_key[len('reddit:'):]
+        # Match reddit.com permalink containing the post id
+        for m in _re.finditer(
+            r'https?://(?:www\.)?reddit\.com/r/\S+/comments/' + _re.escape(post_id) + r'[^\s]*',
+            text
+        ):
+            url = m.group(0)
+            break
+    else:
+        for m in _re.finditer(r'https?://x\.com/\S+/status/' + _re.escape(item_key), text):
+            url = m.group(0)
+            break
+
     category = ''
     first_line = text.split('\n')[0] if text else ''
-    for cat in ['AI Marketing', 'AI Coding', 'AI Design', 'General AI', 'OpenClaw', 'GitHubProjects']:
+    for cat in _KNOWN_CATS:
         if cat in first_line:
             category = cat
             break
@@ -136,47 +153,60 @@ def _extract_tweet_info_from_message(message: dict, tweet_id: str) -> dict:
 
 def handle_interesting(callback_query):
     cb_data = callback_query.get('data', '')
-    tweet_id = cb_data.split(':', 1)[1] if ':' in cb_data else ''
-    if not tweet_id:
+    # Formats: "interesting:{tweet_id}" or "interesting:reddit:{post_id}"
+    item_key = cb_data.split(':', 1)[1] if ':' in cb_data else ''
+    if not item_key:
         return
+
+    # Determine platform from item_key prefix
+    platform = 'reddit' if item_key.startswith('reddit:') else 'twitter'
 
     cq_id = callback_query.get('id')
     message = callback_query.get('message', {})
     chat_id = message.get('chat', {}).get('id')
     message_id = message.get('message_id')
 
-    if bk_exists(tweet_id):
-        # Already saved? -> UNDO
-        bk_remove(tweet_id)
+    if bk_exists(item_key):
+        # Already saved → UNDO
+        bk_remove(item_key)
         existing_markup = message.get('reply_markup')
         if existing_markup and message_id:
-            new_markup = _update_keyboard_toggle(existing_markup, tweet_id, activate=False)
+            new_markup = _update_keyboard_toggle(existing_markup, item_key, activate=False)
             if new_markup:
                 tg_edit_reply_markup(chat_id, message_id, new_markup)
         tg_answer_callback(cq_id, text='🪨 Removed!')
-        print(f"[bot] 🪨 Removed tweet {tweet_id}")
+        print(f"[bot] 🪨 Removed {platform} item {item_key}")
         return
 
-    # Extract info from message
-    info = _extract_tweet_info_from_message(message, tweet_id)
+    # Extract URL and category from the message
+    info = _extract_item_info_from_message(message, item_key, platform)
+
+    # Fallback URL if extraction failed
+    if not info.get('url'):
+        if platform == 'reddit':
+            post_id = item_key[len('reddit:'):]
+            fallback_url = f'https://reddit.com/comments/{post_id}'
+        else:
+            fallback_url = f'https://x.com/i/status/{item_key}'
+        info['url'] = fallback_url
 
     # Save to bookmarks
     bk_save(
-        tweet_id=tweet_id,
-        url=info.get('url', f'https://x.com/i/status/{tweet_id}'),
+        tweet_id=item_key,
+        url=info['url'],
         category=info.get('category', ''),
+        source=platform,
     )
 
     # Update keyboard: 🪨 → 🔥
     existing_markup = message.get('reply_markup')
     if existing_markup and message_id:
-        new_markup = _update_keyboard_toggle(existing_markup, tweet_id, activate=True)
+        new_markup = _update_keyboard_toggle(existing_markup, item_key, activate=True)
         if new_markup:
             tg_edit_reply_markup(chat_id, message_id, new_markup)
 
-    # Answer callback
     tg_answer_callback(cq_id, text='🔥 Saved!')
-    print(f"[bot] 🔥 Saved tweet {tweet_id} (cat={info.get('category', '?')})")
+    print(f"[bot] 🔥 Saved {platform} item {item_key} (cat={info.get('category', '?')})")
 
 
 # ── Main polling loop ────────────────────────────────────────

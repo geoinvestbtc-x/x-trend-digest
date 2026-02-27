@@ -60,6 +60,7 @@ TWITTERAPI_KEY = os.getenv('TWITTERAPI_IO_KEY')
 OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY')
 WEEKLY_MODEL = os.getenv('WEEKLY_DIGEST_MODEL', 'openai/gpt-4o')
 TG_TARGET = os.getenv('TELEGRAM_TARGET')
+WEEKLY_LANG = os.getenv('WEEKLY_DIGEST_LANG', 'ru')  # 'ru' or 'en'
 TG_API = f'https://api.telegram.org/bot{TG_TOKEN}'
 TWITTER_API = 'https://api.twitterapi.io'
 
@@ -171,7 +172,7 @@ def enrich_bookmark(bookmark: dict) -> dict:
 
 # ── LLM Weekly Analysis ──────────────────────────────────────
 
-WEEKLY_SYSTEM_PROMPT = """\
+_WEEKLY_SYSTEM_PROMPT_RU = """\
 Ты — аналитик трендов в AI. Тебе дают подборку интересных твитов за неделю по одной категории.
 
 Напиши УВЛЕКАТЕЛЬНЫЙ и ПОЛЕЗНЫЙ обзор на русском. Пиши как будто рассказываешь другу-разработчику за кофе — живо, с инсайтами, без воды.
@@ -203,6 +204,47 @@ WEEKLY_SYSTEM_PROMPT = """\
 - Если данных мало — лучше короткий честный обзор чем раздутый
 - Общий объём: 800-1500 символов
 """
+
+_WEEKLY_SYSTEM_PROMPT_EN = """\
+You are a trend analyst for AI. You receive a curated collection of interesting tweets from the past week in one category.
+
+Write an ENGAGING and USEFUL review in English. Write as if you're telling a developer friend over coffee — lively, with insights, no fluff.
+
+Format:
+
+🔥 TOP OF THE WEEK
+2-3 most important things that happened. What truly matters.
+
+🛠 NEW TOOLS
+Which new tools / releases / updates appeared. For each:
+- Name + what it does (1 line)
+- Why it's useful in practice
+
+💡 INTERESTING APPROACHES
+What workflows, techniques, ideas people are trying and sharing. Concrete examples.
+
+📊 COMMUNITY OPINION
+What's being discussed in comments, what debates, what consensus emerged.
+
+🎯 TAKEAWAY
+1-2 sentences: what to keep in mind as a practitioner.
+
+RULES:
+- Be specific, no generic phrases like "AI is evolving"
+- Mention authors (@username) when quoting
+- If a tool — say what it does, not just its name
+- Each section max 3-5 lines
+- If data is scarce — a short honest review beats a padded one
+- Total length: 800-1500 characters
+"""
+
+WEEKLY_SYSTEM_PROMPT = _WEEKLY_SYSTEM_PROMPT_RU if WEEKLY_LANG == 'ru' else _WEEKLY_SYSTEM_PROMPT_EN
+
+_WEEKLY_HEADERS_RU = ['🔥 ГЛАВНОЕ ЗА НЕДЕЛЮ', '🛠 НОВЫЕ ИНСТРУМЕНТЫ',
+                      '💡 ИНТЕРЕСНЫЕ ПОДХОДЫ', '📊 МНЕНИЕ СООБЩЕСТВА', '🎯 ВЫВОД']
+_WEEKLY_HEADERS_EN = ['🔥 TOP OF THE WEEK', '🛠 NEW TOOLS',
+                      '💡 INTERESTING APPROACHES', '📊 COMMUNITY OPINION', '🎯 TAKEAWAY']
+WEEKLY_HEADERS = _WEEKLY_HEADERS_RU if WEEKLY_LANG == 'ru' else _WEEKLY_HEADERS_EN
 
 
 def _html_esc(text: str) -> str:
@@ -310,8 +352,7 @@ def format_category_digest(category: str, analysis: str, tweet_count: int) -> st
 
     # Make section headers bold
     formatted = analysis
-    for header in ['🔥 ГЛАВНОЕ ЗА НЕДЕЛЮ', '🛠 НОВЫЕ ИНСТРУМЕНТЫ',
-                   '💡 ИНТЕРЕСНЫЕ ПОДХОДЫ', '📊 МНЕНИЕ СООБЩЕСТВА', '🎯 ВЫВОД']:
+    for header in WEEKLY_HEADERS:
         formatted = formatted.replace(header, f'<b>{header}</b>')
 
     # Escape HTML but preserve our <b> tags
@@ -319,9 +360,10 @@ def format_category_digest(category: str, analysis: str, tweet_count: int) -> st
     escaped = _html_esc(formatted)
     escaped = escaped.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
 
+    subtitle = 'Weekly review' if WEEKLY_LANG == 'en' else 'Обзор за неделю'
     lines = [
         f'{emoji} <b>WEEKLY: {_html_esc(category)}</b>',
-        f'📅 Обзор за неделю · {tweet_count} saved tweets',
+        f'📅 {subtitle} · {tweet_count} saved tweets',
         f'',
         f'━━━━━━━━━━━━━━━━━━━━',
         f'',
