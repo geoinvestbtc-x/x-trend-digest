@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import random
 import time
@@ -14,6 +15,25 @@ MAX_PAGES_TOP     = int(os.getenv('DISCOVER_MAX_PAGES_TOP', '3'))
 MAX_PAGES_LATEST  = int(os.getenv('DISCOVER_MAX_PAGES_LATEST', '4'))
 MAX_ITEMS_PER_QUERY = int(os.getenv('DISCOVER_MAX_ITEMS', '120'))
 STOP_IF_OLDER_HOURS = int(os.getenv('DISCOVER_STOP_OLDER_H', '48'))
+
+# ── Trends knobs ──────────────────────────────────────────────
+TRENDS_ENABLED    = os.getenv('DISCOVER_TRENDS_ENABLED', '1') == '1'
+TRENDS_WOEID      = int(os.getenv('DISCOVER_TRENDS_WOEID', '1'))  # 1 = worldwide
+TRENDS_MAX_PER_CAT = int(os.getenv('DISCOVER_TRENDS_MAX_PER_CAT', '3'))
+
+# ── Dynamic author discovery knobs ────────────────────────────
+DYN_AUTHORS_ENABLED   = os.getenv('DISCOVER_DYN_AUTHORS_ENABLED', '1') == '1'
+DYN_AUTHORS_PER_CAT   = int(os.getenv('DISCOVER_DYN_AUTHORS_PER_CAT', '3'))
+DYN_AUTHORS_CACHE_H   = int(os.getenv('DISCOVER_DYN_AUTHORS_CACHE_H', '24'))
+
+# ── Quote tweets knobs ────────────────────────────────────────
+QUOTES_ENABLED     = os.getenv('DISCOVER_QUOTES_ENABLED', '1') == '1'
+QUOTES_TOP_N       = int(os.getenv('DISCOVER_QUOTES_TOP_N', '5'))   # top N tweets per category to expand
+QUOTES_MAX_PER_TWEET = int(os.getenv('DISCOVER_QUOTES_MAX', '20'))  # max quote tweets to fetch per tweet
+
+# ── Community search knobs ─────────────────────────────────────
+COMMUNITIES_ENABLED   = os.getenv('DISCOVER_COMMUNITIES_ENABLED', '1') == '1'
+COMMUNITIES_MAX_PAGES = int(os.getenv('DISCOVER_COMMUNITIES_MAX_PAGES', '2'))
 
 # ── Category queries ──────────────────────────────────────────
 CATEGORY_QUERIES = {
@@ -41,6 +61,63 @@ CATEGORY_QUERIES = {
         "Top":    '(openclaw OR "open claw") (marketing OR growth OR automation OR mcp OR workflow OR agent) lang:en -is:retweet',
         "Latest": '(openclaw OR "open claw") (marketing OR growth OR automation OR mcp OR workflow OR agent) lang:en -is:retweet',
     },
+}
+
+# Keywords used to map trending topics → categories
+CATEGORY_TREND_KEYWORDS = {
+    "AI Marketing": [
+        "marketing", "growth", "seo", "content", "ads", "brand", "campaign",
+        "audience", "funnel", "copywriting", "virality", "tiktok", "instagram",
+    ],
+    "AI Coding": [
+        "code", "coding", "developer", "programming", "python", "javascript",
+        "typescript", "github", "claude", "cursor", "copilot", "mcp", "llm",
+        "api", "open source", "framework", "devtools",
+    ],
+    "AI Design": [
+        "design", "figma", "ui", "ux", "prototype", "css", "frontend",
+        "typography", "animation", "creative", "midjourney", "stable diffusion",
+    ],
+    "General AI": [
+        "ai", "artificial intelligence", "gpt", "openai", "anthropic", "gemini",
+        "llama", "model", "agent", "inference", "benchmark", "research", "paper",
+    ],
+    "AI Business": [
+        "saas", "startup", "revenue", "mrr", "arr", "monetize", "business",
+        "entrepreneur", "product", "launch", "funding", "vc", "indie hacker",
+    ],
+}
+
+# Community search queries per category — used for "Search Tweets From All Community"
+CATEGORY_COMMUNITY_QUERIES = {
+    "AI Marketing": [
+        "ai marketing automation growth",
+        "vibe marketing content engine",
+    ],
+    "AI Coding": [
+        "claude code cursor mcp agentic",
+        "ai coding dev workflow llm",
+    ],
+    "AI Design": [
+        "ai design figma ux prototype",
+    ],
+    "General AI": [
+        "llm ai agents openai anthropic",
+        "ai paper benchmark release",
+    ],
+    "AI Business": [
+        "ai saas startup revenue mrr",
+        "built with ai indie hacker",
+    ],
+}
+
+# Search terms used to find dynamic authors per category
+CATEGORY_AUTHOR_SEARCH_TERMS = {
+    "AI Marketing": "AI marketing expert",
+    "AI Coding": "AI coding developer tools",
+    "AI Design": "AI design UX tools",
+    "General AI": "AI researcher LLM",
+    "AI Business": "AI startup founder SaaS",
 }
 
 
@@ -179,6 +256,371 @@ def _to_candidate(category: str, tw: dict, source: str = "keyword"):
     }
 
 
+# ── Trends discovery ─────────────────────────────────────────
+
+def _fetch_trends(woeid: int = 1) -> list[dict]:
+    """Fetch trending topics from twitterapi.io.
+
+    Returns list of dicts: {name, query, rank, description}
+    """
+    url = f"{API_BASE}/twitter/trends"
+    headers = _headers()
+    try:
+        r = _request_with_backoff(url, headers, {"woeid": woeid}, timeout=30, retries=2)
+        data = r.json()
+        trends = data.get("trends") or []
+        result = []
+        for t in trends:
+            name = t.get("name") or ""
+            query = (t.get("target") or {}).get("query") or name
+            rank = t.get("rank") or 999
+            desc = t.get("meta_description") or ""
+            if name:
+                result.append({"name": name, "query": query, "rank": rank, "description": desc})
+        print(f"[x-trend][trends] fetched {len(result)} trends (woeid={woeid})")
+        return result
+    except Exception as e:
+        print(f"[x-trend][trends] ERROR fetching trends: {e}")
+        return []
+
+
+def _match_trends_to_categories(trends: list[dict]) -> dict[str, list[dict]]:
+    """Match trending topics to categories by keyword overlap.
+
+    Returns {category: [trend, ...]} keeping at most TRENDS_MAX_PER_CAT per category.
+    """
+    matched: dict[str, list[dict]] = {cat: [] for cat in CATEGORY_TREND_KEYWORDS}
+    for trend in trends:
+        name_lower = trend["name"].lower()
+        desc_lower = trend["description"].lower()
+        text = f"{name_lower} {desc_lower}"
+        for cat, keywords in CATEGORY_TREND_KEYWORDS.items():
+            if len(matched[cat]) >= TRENDS_MAX_PER_CAT:
+                continue
+            if any(kw in text for kw in keywords):
+                matched[cat].append(trend)
+    for cat, hits in matched.items():
+        if hits:
+            print(f"[x-trend][trends] cat={cat} matched {len(hits)} trends: "
+                  f"{', '.join(t['name'] for t in hits)}")
+    return matched
+
+
+def _search_trends_for_category(category: str, trend: dict, seen_ids: set) -> list[dict]:
+    """Run a Top search for a single matched trend and return new candidates."""
+    query = trend["query"]
+    # Add lang and engagement filters since trend queries are bare
+    full_query = f"({query}) min_faves:5 lang:en -is:retweet -is:reply"
+    print(f"[x-trend][trends] searching trend '{trend['name']}' for cat={category}")
+    try:
+        tweets = _paginated_search(category, full_query, "Top", max_pages=2)
+        items = []
+        for tw in tweets:
+            tid = str(tw.get("id") or "")
+            if tid and tid in seen_ids:
+                continue
+            seen_ids.add(tid)
+            c = _to_candidate(category, tw, source="trend")
+            c["trend_name"] = trend["name"]
+            items.append(c)
+        print(f"[x-trend][trends] trend '{trend['name']}' → {len(items)} new candidates")
+        return items
+    except Exception as e:
+        print(f"[x-trend][trends] ERROR searching trend '{trend['name']}': {e}")
+        return []
+
+
+# ── Dynamic author search ─────────────────────────────────────
+
+def _dyn_authors_cache_path() -> Path:
+    root = Path(__file__).resolve().parent.parent
+    return root / "data" / "dynamic_authors_cache.json"
+
+
+def _load_dyn_authors_cache() -> dict:
+    """Load cached dynamic authors. Returns {category: {usernames: [...], cached_at: iso}}."""
+    path = _dyn_authors_cache_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_dyn_authors_cache(cache: dict):
+    path = _dyn_authors_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _search_users_by_keyword(keyword: str, limit: int = 20) -> list[str]:
+    """Search Twitter users by keyword, return list of usernames."""
+    url = f"{API_BASE}/twitter/user/search"
+    headers = _headers()
+    try:
+        r = _request_with_backoff(url, headers, {"query": keyword}, timeout=30, retries=2)
+        data = r.json()
+        # Response may be {"users": [...]} or {"data": [...]}
+        users = data.get("users") or data.get("data") or []
+        if isinstance(users, dict):
+            users = users.get("users", [])
+        usernames = []
+        for u in users[:limit]:
+            uname = u.get("userName") or u.get("username") or u.get("screen_name") or ""
+            followers = u.get("followers") or u.get("followersCount") or 0
+            # Only include accounts with meaningful following (avoid bots)
+            if uname and followers >= 500:
+                usernames.append(uname.lstrip("@"))
+        print(f"[x-trend][dyn_authors] keyword='{keyword}' → {len(usernames)} users found")
+        return usernames
+    except Exception as e:
+        print(f"[x-trend][dyn_authors] ERROR searching users for '{keyword}': {e}")
+        return []
+
+
+def _get_dynamic_authors(category: str) -> list[str]:
+    """Return dynamic authors for a category, using cache if fresh enough."""
+    cache = _load_dyn_authors_cache()
+    now = datetime.now(timezone.utc)
+    entry = cache.get(category)
+    if entry:
+        cached_at_str = entry.get("cached_at", "")
+        try:
+            cached_at = datetime.fromisoformat(cached_at_str)
+            if (now - cached_at).total_seconds() / 3600 < DYN_AUTHORS_CACHE_H:
+                usernames = entry.get("usernames", [])
+                print(f"[x-trend][dyn_authors] cat={category} cache hit → {len(usernames)} authors")
+                return usernames
+        except Exception:
+            pass
+
+    keyword = CATEGORY_AUTHOR_SEARCH_TERMS.get(category)
+    if not keyword:
+        return []
+
+    usernames = _search_users_by_keyword(keyword, limit=30)
+    cache[category] = {
+        "usernames": usernames,
+        "cached_at": now.isoformat(),
+    }
+    _save_dyn_authors_cache(cache)
+    return usernames[:DYN_AUTHORS_PER_CAT * 3]  # keep buffer, caller slices
+
+
+# ── Quote tweets ──────────────────────────────────────────────
+
+def _fetch_quotations(tweet_id: str, max_items: int = 20) -> list[dict]:
+    """Fetch quote tweets for a given tweet_id."""
+    url = f"{API_BASE}/twitter/tweet/quotations"
+    headers = _headers()
+    try:
+        r = _request_with_backoff(
+            url, headers, {"tweet_id": tweet_id, "count": max_items}, timeout=30, retries=2
+        )
+        data = r.json()
+        tweets = data.get("tweets") or data.get("data") or []
+        if isinstance(tweets, dict):
+            tweets = tweets.get("tweets", [])
+        return tweets
+    except Exception as e:
+        print(f"[x-trend][quotes] ERROR fetching quotations for {tweet_id}: {e}")
+        return []
+
+
+def _expand_with_quotations(category: str, candidates: list[dict], seen_ids: set) -> list[dict]:
+    """For top-N candidates by engagement, fetch their quote tweets and add as new candidates."""
+    if not QUOTES_ENABLED or not candidates:
+        return []
+
+    # Pick top N by like+bookmark engagement to expand
+    def _eng(c):
+        m = c.get("metrics", {})
+        return m.get("like", 0) + m.get("bookmark", 0) * 2 + m.get("retweet", 0)
+
+    top = sorted(candidates, key=_eng, reverse=True)[:QUOTES_TOP_N]
+    new_items = []
+    for c in top:
+        tid = c.get("id", "")
+        if not tid:
+            continue
+        print(f"[x-trend][quotes] expanding tweet {tid} (cat={category})")
+        raw_quotes = _fetch_quotations(tid, max_items=QUOTES_MAX_PER_TWEET)
+        added = 0
+        for tw in raw_quotes:
+            if not _in_window(tw.get("createdAt", "")):
+                continue
+            qid = str(tw.get("id") or "")
+            if qid and qid in seen_ids:
+                continue
+            seen_ids.add(qid)
+            qt_candidate = _to_candidate(category, tw, source="quote")
+            qt_candidate["quoted_id"] = tid
+            new_items.append(qt_candidate)
+            added += 1
+        _sleep(base=1.2, jitter=0.8)
+        if added:
+            print(f"[x-trend][quotes]   → {added} quote tweets added")
+    return new_items
+
+
+# ── Tweet Thread Context ──────────────────────────────────────
+
+def fetch_tweet_thread(tweet_id: str) -> list[dict]:
+    """Fetch the full thread for a given tweet_id.
+
+    Uses /twitter/tweet/thread_context endpoint which returns all tweets
+    in a thread (ancestors + the tweet + its replies within the thread).
+    Falls back to /twitter/tweet/replies if the primary endpoint fails.
+
+    Returns list of tweet dicts in chronological order, or [] on error.
+    """
+    url = f"{API_BASE}/twitter/tweet/thread_context"
+    headers = _headers()
+    try:
+        r = _request_with_backoff(url, headers, {"tweet_id": tweet_id}, timeout=30, retries=2)
+        data = r.json()
+        tweets = data.get("tweets") or data.get("thread") or []
+        if isinstance(tweets, dict):
+            tweets = tweets.get("tweets", [])
+        return tweets
+    except Exception as e:
+        status = getattr(getattr(e, 'response', None), 'status_code', None)
+        if status == 404:
+            # endpoint not found → try replies fallback
+            return _fetch_thread_via_replies(tweet_id)
+        print(f"[x-trend][thread] ERROR fetching thread for {tweet_id}: {e}")
+        return []
+
+
+def _fetch_thread_via_replies(tweet_id: str) -> list[dict]:
+    """Fallback: fetch thread by calling /twitter/tweet/replies (first page only)."""
+    url = f"{API_BASE}/twitter/tweet/replies"
+    headers = _headers()
+    try:
+        r = _request_with_backoff(url, headers, {"tweet_id": tweet_id, "cursor": ""}, timeout=30, retries=2)
+        data = r.json()
+        tweets = data.get("tweets") or []
+        return tweets
+    except Exception as e:
+        print(f"[x-trend][thread] replies fallback ERROR for {tweet_id}: {e}")
+        return []
+
+
+def build_thread_text(root_tweet: dict, thread_tweets: list[dict]) -> str:
+    """Concatenate root + thread tweets into a single text block for LLM context.
+
+    Returns a string like:
+      [Thread by @username]
+      1/ First tweet text
+      2/ Second tweet text
+      ...
+    """
+    author = (root_tweet.get("author") or {}).get("userName") or "?"
+    lines = [f"[Thread by @{author}]"]
+    all_tweets = [root_tweet] + [t for t in thread_tweets if str(t.get("id")) != str(root_tweet.get("id"))]
+    # Sort by createdAt if available
+    def _ts(t):
+        dt = _parse_created_at(t.get("createdAt", ""))
+        return dt.timestamp() if dt else 0
+    all_tweets.sort(key=_ts)
+    for i, tw in enumerate(all_tweets, 1):
+        text = (tw.get("text") or "").strip()
+        if text:
+            lines.append(f"{i}/ {text}")
+    return "\n".join(lines)
+
+
+# ── Community tweet search ────────────────────────────────────
+
+def _paginated_community_search(category: str, query: str, max_pages: int) -> list[dict]:
+    """Search tweets from all Twitter Communities for a given query.
+
+    Uses GET /twitter/community/search endpoint (Search Tweets From All Community).
+    Returns tweets in the discovery window.
+    """
+    url = f"{API_BASE}/twitter/community/search"
+    headers = _headers()
+    cursor = ""
+    all_tweets = []
+    pages_fetched = 0
+
+    for page_idx in range(max_pages):
+        params = {"query": query, "cursor": cursor}
+        try:
+            r = _request_with_backoff(url, headers, params, timeout=40, retries=2)
+        except Exception as e:
+            print(f"[x-trend][community] ERROR page={page_idx+1} query='{query}': {e}")
+            break
+
+        j = r.json()
+        tweets = j.get("tweets") or j.get("data") or []
+        if isinstance(tweets, dict):
+            tweets = tweets.get("tweets", [])
+
+        has_next = bool(j.get("has_next_page") or j.get("has_more"))
+        next_cursor = j.get("next_cursor") or j.get("cursor") or ""
+        pages_fetched += 1
+        all_tweets.extend(tweets)
+
+        print(
+            f"[x-trend][community] cat={category} page={page_idx+1} "
+            f"items={len(tweets)} total={len(all_tweets)} has_next={'1' if has_next else '0'}"
+        )
+
+        if not has_next or not next_cursor:
+            break
+        if len(all_tweets) >= MAX_ITEMS_PER_QUERY:
+            break
+
+        in_window_count = sum(1 for t in tweets if _in_window(t.get("createdAt", "")))
+        if tweets and in_window_count / len(tweets) < 0.3:
+            print(f"[x-trend][community]   → stop: most tweets outside window")
+            break
+
+        cursor = next_cursor
+        _sleep(base=2.0, jitter=1.2)
+
+    kept = [t for t in all_tweets if _in_window(t.get("createdAt", ""))]
+    print(
+        f"[x-trend][community] DONE cat={category} query='{query[:40]}' "
+        f"pages={pages_fetched} total={len(all_tweets)} kept={len(kept)}"
+    )
+    return kept
+
+
+def _discover_communities(category: str, seen_ids: set) -> list[dict]:
+    """Run community search for all queries of a category, return new candidates."""
+    if not COMMUNITIES_ENABLED:
+        return []
+
+    queries = CATEGORY_COMMUNITY_QUERIES.get(category, [])
+    if not queries:
+        return []
+
+    items = []
+    for query in queries:
+        print(f"[x-trend][community] searching cat={category} query='{query}'")
+        try:
+            tweets = _paginated_community_search(category, query, max_pages=COMMUNITIES_MAX_PAGES)
+            added = 0
+            for tw in tweets:
+                tid = str(tw.get("id") or "")
+                if tid and tid in seen_ids:
+                    continue
+                seen_ids.add(tid)
+                c = _to_candidate(category, tw, source="community")
+                items.append(c)
+                added += 1
+            if added:
+                print(f"[x-trend][community] query='{query[:40]}' → {added} new candidates")
+        except Exception as e:
+            print(f"[x-trend][community] ERROR cat={category} query='{query}': {e}")
+        _sleep(base=2.0, jitter=1.0)
+
+    return items
+
+
 # ── Author-based discovery ──────────────────────────────────
 
 def _load_authors() -> dict:
@@ -240,6 +682,16 @@ def run(max_pages: int = 2, only_category=None):
     out = []
     authors_map = _load_authors()
 
+    # ── Fetch trending topics once for all categories ──
+    trends_by_category: dict[str, list[dict]] = {}
+    if TRENDS_ENABLED:
+        _sleep(base=1.0, jitter=0.5)
+        all_trends = _fetch_trends(woeid=TRENDS_WOEID)
+        if all_trends:
+            trends_by_category = _match_trends_to_categories(all_trends)
+    else:
+        print("[x-trend][discover] Trends disabled (DISCOVER_TRENDS_ENABLED=0)")
+
     categories = list(CATEGORY_QUERIES.items())
     if only_category:
         categories = [(c, qs) for (c, qs) in categories if c == only_category]
@@ -249,6 +701,10 @@ def run(max_pages: int = 2, only_category=None):
         seen_ids = set()
         keyword_found = 0
         author_found = 0
+        trend_found = 0
+        quote_found = 0
+        dyn_author_found = 0
+        community_found = 0
 
         # ── Keyword discovery ──
         for query_type in ("Top", "Latest"):
@@ -269,16 +725,60 @@ def run(max_pages: int = 2, only_category=None):
                 print(f"[x-trend][discover] ERROR cat={category} type={query_type}: {e}")
             _sleep(base=2.0, jitter=1.5)
 
-        # ── Author discovery ──
+        # ── Trend-based discovery ──
+        matched_trends = trends_by_category.get(category, [])
+        for trend in matched_trends:
+            trend_items = _search_trends_for_category(category, trend, seen_ids)
+            all_items.extend(trend_items)
+            trend_found += len(trend_items)
+            _sleep(base=2.0, jitter=1.0)
+
+        # ── Quote tweet expansion (on keyword + trend candidates) ──
+        if QUOTES_ENABLED and all_items:
+            quote_items = _expand_with_quotations(category, all_items, seen_ids)
+            all_items.extend(quote_items)
+            quote_found = len(quote_items)
+
+        # ── Static author discovery ──
         cat_authors = authors_map.get(category, [])
         if cat_authors:
             author_items = _discover_authors(category, cat_authors, seen_ids)
             all_items.extend(author_items)
             author_found = len(author_items)
 
+        # ── Dynamic author discovery ──
+        if DYN_AUTHORS_ENABLED:
+            try:
+                dyn_usernames = _get_dynamic_authors(category)
+                # Exclude usernames already in the static list
+                static_set = {u.lower() for u in cat_authors}
+                dyn_usernames = [u for u in dyn_usernames if u.lower() not in static_set]
+                dyn_usernames = dyn_usernames[:DYN_AUTHORS_PER_CAT]
+                if dyn_usernames:
+                    dyn_items = _discover_authors(category, dyn_usernames, seen_ids)
+                    all_items.extend(dyn_items)
+                    dyn_author_found = len(dyn_items)
+            except Exception as e:
+                print(f"[x-trend][dyn_authors] ERROR cat={category}: {e}")
+            _sleep(base=1.5, jitter=1.0)
+
+        # ── Community tweet search ──
+        if COMMUNITIES_ENABLED:
+            try:
+                community_items = _discover_communities(category, seen_ids)
+                all_items.extend(community_items)
+                community_found = len(community_items)
+            except Exception as e:
+                print(f"[x-trend][community] ERROR cat={category}: {e}")
+            _sleep(base=1.5, jitter=1.0)
+
         merged = len(all_items)
-        print(f"[x-trend][discover] cat={category} keyword_found={keyword_found} "
-              f"author_found={author_found} merged_total={merged}")
+        print(
+            f"[x-trend][discover] cat={category} "
+            f"keyword={keyword_found} trend={trend_found} quotes={quote_found} "
+            f"authors_static={author_found} authors_dyn={dyn_author_found} "
+            f"community={community_found} total={merged}"
+        )
 
         out.append({"category": category, "items": all_items, "error": None})
 

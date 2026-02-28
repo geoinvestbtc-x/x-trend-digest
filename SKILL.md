@@ -87,3 +87,25 @@ python3 scripts/weekly_digest.py
 
 ### Optional env
 - `WEEKLY_DIGEST_MODEL=openai/gpt-4o` (LLM for weekly analysis)
+
+## Discovery Knobs (env vars)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DISCOVER_MAX_PAGES_TOP` | `3` | Pages for Top search per category |
+| `DISCOVER_MAX_PAGES_LATEST` | `4` | Pages for Latest search per category |
+| `DISCOVER_MAX_ITEMS` | `120` | Max items per query before stopping |
+| `DISCOVER_STOP_OLDER_H` | `48` | Stop paginating when >70% tweets are older than this many hours |
+| `DISCOVER_TRENDS_ENABLED` | `1` | Fetch and search trending topics |
+| `DISCOVER_TRENDS_WOEID` | `1` | WOEID for trends (1 = worldwide) |
+| `DISCOVER_TRENDS_MAX_PER_CAT` | `3` | Max matched trends per category |
+| `DISCOVER_DYN_AUTHORS_ENABLED` | `1` | Dynamically discover influential authors per category |
+| `DISCOVER_DYN_AUTHORS_PER_CAT` | `3` | Max dynamic authors to fetch per category |
+| `DISCOVER_DYN_AUTHORS_CACHE_H` | `24` | Cache TTL for dynamic authors (hours) |
+| `DISCOVER_QUOTES_ENABLED` | `1` | Expand top tweets with their quote tweets |
+| `DISCOVER_QUOTES_TOP_N` | `5` | Top N tweets per category to expand with quotes |
+| `DISCOVER_QUOTES_MAX` | `20` | Max quote tweets per tweet |
+| `DISCOVER_COMMUNITIES_ENABLED` | `1` | Search tweets from Twitter Communities |
+| `DISCOVER_COMMUNITIES_MAX_PAGES` | `2` | Pages per community search query |
+| `THREAD_CONTEXT_ENABLED` | `1` | Enrich top candidates with full tweet thread before LLM |
+| `THREAD_CONTEXT_TOP_N` | `5` | Top N ranked candidates per category to enrich with thread |
