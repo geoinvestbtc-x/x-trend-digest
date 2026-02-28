@@ -31,6 +31,10 @@ QUOTES_ENABLED     = os.getenv('DISCOVER_QUOTES_ENABLED', '1') == '1'
 QUOTES_TOP_N       = int(os.getenv('DISCOVER_QUOTES_TOP_N', '5'))   # top N tweets per category to expand
 QUOTES_MAX_PER_TWEET = int(os.getenv('DISCOVER_QUOTES_MAX', '20'))  # max quote tweets to fetch per tweet
 
+# ── Community search knobs ─────────────────────────────────────
+COMMUNITIES_ENABLED   = os.getenv('DISCOVER_COMMUNITIES_ENABLED', '1') == '1'
+COMMUNITIES_MAX_PAGES = int(os.getenv('DISCOVER_COMMUNITIES_MAX_PAGES', '2'))
+
 # ── Category queries ──────────────────────────────────────────
 CATEGORY_QUERIES = {
     "AI Marketing": {
@@ -81,6 +85,29 @@ CATEGORY_TREND_KEYWORDS = {
     "AI Business": [
         "saas", "startup", "revenue", "mrr", "arr", "monetize", "business",
         "entrepreneur", "product", "launch", "funding", "vc", "indie hacker",
+    ],
+}
+
+# Community search queries per category — used for "Search Tweets From All Community"
+CATEGORY_COMMUNITY_QUERIES = {
+    "AI Marketing": [
+        "ai marketing automation growth",
+        "vibe marketing content engine",
+    ],
+    "AI Coding": [
+        "claude code cursor mcp agentic",
+        "ai coding dev workflow llm",
+    ],
+    "AI Design": [
+        "ai design figma ux prototype",
+    ],
+    "General AI": [
+        "llm ai agents openai anthropic",
+        "ai paper benchmark release",
+    ],
+    "AI Business": [
+        "ai saas startup revenue mrr",
+        "built with ai indie hacker",
     ],
 }
 
@@ -437,6 +464,163 @@ def _expand_with_quotations(category: str, candidates: list[dict], seen_ids: set
     return new_items
 
 
+# ── Tweet Thread Context ──────────────────────────────────────
+
+def fetch_tweet_thread(tweet_id: str) -> list[dict]:
+    """Fetch the full thread for a given tweet_id.
+
+    Uses /twitter/tweet/thread_context endpoint which returns all tweets
+    in a thread (ancestors + the tweet + its replies within the thread).
+    Falls back to /twitter/tweet/replies if the primary endpoint fails.
+
+    Returns list of tweet dicts in chronological order, or [] on error.
+    """
+    url = f"{API_BASE}/twitter/tweet/thread_context"
+    headers = _headers()
+    try:
+        r = _request_with_backoff(url, headers, {"tweet_id": tweet_id}, timeout=30, retries=2)
+        data = r.json()
+        tweets = data.get("tweets") or data.get("thread") or []
+        if isinstance(tweets, dict):
+            tweets = tweets.get("tweets", [])
+        return tweets
+    except Exception as e:
+        status = getattr(getattr(e, 'response', None), 'status_code', None)
+        if status == 404:
+            # endpoint not found → try replies fallback
+            return _fetch_thread_via_replies(tweet_id)
+        print(f"[x-trend][thread] ERROR fetching thread for {tweet_id}: {e}")
+        return []
+
+
+def _fetch_thread_via_replies(tweet_id: str) -> list[dict]:
+    """Fallback: fetch thread by calling /twitter/tweet/replies (first page only)."""
+    url = f"{API_BASE}/twitter/tweet/replies"
+    headers = _headers()
+    try:
+        r = _request_with_backoff(url, headers, {"tweet_id": tweet_id, "cursor": ""}, timeout=30, retries=2)
+        data = r.json()
+        tweets = data.get("tweets") or []
+        return tweets
+    except Exception as e:
+        print(f"[x-trend][thread] replies fallback ERROR for {tweet_id}: {e}")
+        return []
+
+
+def build_thread_text(root_tweet: dict, thread_tweets: list[dict]) -> str:
+    """Concatenate root + thread tweets into a single text block for LLM context.
+
+    Returns a string like:
+      [Thread by @username]
+      1/ First tweet text
+      2/ Second tweet text
+      ...
+    """
+    author = (root_tweet.get("author") or {}).get("userName") or "?"
+    lines = [f"[Thread by @{author}]"]
+    all_tweets = [root_tweet] + [t for t in thread_tweets if str(t.get("id")) != str(root_tweet.get("id"))]
+    # Sort by createdAt if available
+    def _ts(t):
+        dt = _parse_created_at(t.get("createdAt", ""))
+        return dt.timestamp() if dt else 0
+    all_tweets.sort(key=_ts)
+    for i, tw in enumerate(all_tweets, 1):
+        text = (tw.get("text") or "").strip()
+        if text:
+            lines.append(f"{i}/ {text}")
+    return "\n".join(lines)
+
+
+# ── Community tweet search ────────────────────────────────────
+
+def _paginated_community_search(category: str, query: str, max_pages: int) -> list[dict]:
+    """Search tweets from all Twitter Communities for a given query.
+
+    Uses GET /twitter/community/search endpoint (Search Tweets From All Community).
+    Returns tweets in the discovery window.
+    """
+    url = f"{API_BASE}/twitter/community/search"
+    headers = _headers()
+    cursor = ""
+    all_tweets = []
+    pages_fetched = 0
+
+    for page_idx in range(max_pages):
+        params = {"query": query, "cursor": cursor}
+        try:
+            r = _request_with_backoff(url, headers, params, timeout=40, retries=2)
+        except Exception as e:
+            print(f"[x-trend][community] ERROR page={page_idx+1} query='{query}': {e}")
+            break
+
+        j = r.json()
+        tweets = j.get("tweets") or j.get("data") or []
+        if isinstance(tweets, dict):
+            tweets = tweets.get("tweets", [])
+
+        has_next = bool(j.get("has_next_page") or j.get("has_more"))
+        next_cursor = j.get("next_cursor") or j.get("cursor") or ""
+        pages_fetched += 1
+        all_tweets.extend(tweets)
+
+        print(
+            f"[x-trend][community] cat={category} page={page_idx+1} "
+            f"items={len(tweets)} total={len(all_tweets)} has_next={'1' if has_next else '0'}"
+        )
+
+        if not has_next or not next_cursor:
+            break
+        if len(all_tweets) >= MAX_ITEMS_PER_QUERY:
+            break
+
+        in_window_count = sum(1 for t in tweets if _in_window(t.get("createdAt", "")))
+        if tweets and in_window_count / len(tweets) < 0.3:
+            print(f"[x-trend][community]   → stop: most tweets outside window")
+            break
+
+        cursor = next_cursor
+        _sleep(base=2.0, jitter=1.2)
+
+    kept = [t for t in all_tweets if _in_window(t.get("createdAt", ""))]
+    print(
+        f"[x-trend][community] DONE cat={category} query='{query[:40]}' "
+        f"pages={pages_fetched} total={len(all_tweets)} kept={len(kept)}"
+    )
+    return kept
+
+
+def _discover_communities(category: str, seen_ids: set) -> list[dict]:
+    """Run community search for all queries of a category, return new candidates."""
+    if not COMMUNITIES_ENABLED:
+        return []
+
+    queries = CATEGORY_COMMUNITY_QUERIES.get(category, [])
+    if not queries:
+        return []
+
+    items = []
+    for query in queries:
+        print(f"[x-trend][community] searching cat={category} query='{query}'")
+        try:
+            tweets = _paginated_community_search(category, query, max_pages=COMMUNITIES_MAX_PAGES)
+            added = 0
+            for tw in tweets:
+                tid = str(tw.get("id") or "")
+                if tid and tid in seen_ids:
+                    continue
+                seen_ids.add(tid)
+                c = _to_candidate(category, tw, source="community")
+                items.append(c)
+                added += 1
+            if added:
+                print(f"[x-trend][community] query='{query[:40]}' → {added} new candidates")
+        except Exception as e:
+            print(f"[x-trend][community] ERROR cat={category} query='{query}': {e}")
+        _sleep(base=2.0, jitter=1.0)
+
+    return items
+
+
 # ── Author-based discovery ──────────────────────────────────
 
 def _load_authors() -> dict:
@@ -520,6 +704,7 @@ def run(max_pages: int = 2, only_category=None):
         trend_found = 0
         quote_found = 0
         dyn_author_found = 0
+        community_found = 0
 
         # ── Keyword discovery ──
         for query_type in ("Top", "Latest"):
@@ -577,12 +762,22 @@ def run(max_pages: int = 2, only_category=None):
                 print(f"[x-trend][dyn_authors] ERROR cat={category}: {e}")
             _sleep(base=1.5, jitter=1.0)
 
+        # ── Community tweet search ──
+        if COMMUNITIES_ENABLED:
+            try:
+                community_items = _discover_communities(category, seen_ids)
+                all_items.extend(community_items)
+                community_found = len(community_items)
+            except Exception as e:
+                print(f"[x-trend][community] ERROR cat={category}: {e}")
+            _sleep(base=1.5, jitter=1.0)
+
         merged = len(all_items)
         print(
             f"[x-trend][discover] cat={category} "
             f"keyword={keyword_found} trend={trend_found} quotes={quote_found} "
             f"authors_static={author_found} authors_dyn={dyn_author_found} "
-            f"total={merged}"
+            f"community={community_found} total={merged}"
         )
 
         out.append({"category": category, "items": all_items, "error": None})

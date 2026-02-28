@@ -7,7 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from discover import run as discover_run
+from discover import run as discover_run, fetch_tweet_thread, build_thread_text
 from normalize import run as normalize_run
 from extract import run as extract_run
 from rank import run as rank_run
@@ -89,6 +89,9 @@ def main():
     print(f"  memory_days    : {memory_days}")
     print(f"  DIGEST_MODEL   : {os.getenv('DIGEST_MODEL', 'openai/gpt-5-mini')}")
     print(f"  ONLY_CATEGORY  : {os.getenv('DIGEST_ONLY_CATEGORY', '(all)')}")
+    thread_ctx_enabled = os.getenv('THREAD_CONTEXT_ENABLED', '1') == '1'
+    thread_ctx_top_n = int(os.getenv('THREAD_CONTEXT_TOP_N', '5'))
+    print(f"  THREAD_CONTEXT : {'enabled' if thread_ctx_enabled else 'disabled'} (top_n={thread_ctx_top_n})")
     print(f"  SEND_TELEGRAM  : {os.getenv('SEND_TELEGRAM', '0')}")
     print(f"  TELEGRAM_TARGET: {os.getenv('TELEGRAM_TARGET', '(not set)')}")
     print(f"  OPENROUTER_KEY : {_mask(os.getenv('OPENROUTER_API_KEY', ''))}")
@@ -181,6 +184,58 @@ def main():
             funnel[it.get('category', '?')]['after_rank'] += 1
     print(f"  total ranked: {len(ranked)}")
     print(f"{'='*60}\n")
+
+    # ══════════════════════════════════════════════════════════
+    # STAGE 3b: THREAD CONTEXT ENRICHMENT
+    # ══════════════════════════════════════════════════════════
+    if thread_ctx_enabled and ranked:
+        print(f"{'='*60}")
+        print(f"[STAGE 3b] THREAD CONTEXT ENRICHMENT (top_n={thread_ctx_top_n} per category)")
+        print(f"{'='*60}")
+
+        from collections import defaultdict as _dd
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        _cat_seen = _dd(int)
+        _to_enrich, _skip_enrich = [], []
+        for _item in ranked:
+            _cat = _item.get('category', '?')
+            if _cat_seen[_cat] < thread_ctx_top_n:
+                _to_enrich.append(_item)
+                _cat_seen[_cat] += 1
+            else:
+                _skip_enrich.append(_item)
+
+        _rate_lock = threading.Semaphore(3)
+
+        def _enrich_with_thread(item):
+            tid = str(item.get('id', ''))
+            if not tid:
+                return item
+            # Only fetch thread if the tweet has meaningful reply count (likely a thread)
+            # or if it has a conversationId that may differ from its own id
+            reply_count = (item.get('metrics') or {}).get('reply', 0)
+            if reply_count < 1:
+                return item
+            with _rate_lock:
+                thread_tweets = fetch_tweet_thread(tid)
+                time.sleep(0.6)
+            if not thread_tweets or len(thread_tweets) <= 1:
+                return item
+            item = dict(item)
+            item['text'] = build_thread_text(item, thread_tweets)
+            item['thread_size'] = len(thread_tweets)
+            return item
+
+        print(f"  Fetching thread context for {len(_to_enrich)} candidates...")
+        with ThreadPoolExecutor(max_workers=3) as _pool:
+            _enriched = list(_pool.map(_enrich_with_thread, _to_enrich))
+
+        thread_enriched_count = sum(1 for e in _enriched if e.get('thread_size', 0) > 1)
+        ranked = _enriched + _skip_enrich
+        print(f"  Thread enrichment done: {thread_enriched_count}/{len(_to_enrich)} threads expanded")
+        print(f"{'='*60}\n")
 
     # ══════════════════════════════════════════════════════════
     # STAGE 4: SUMMARIZE / LLM (logging inside summarize.py)
