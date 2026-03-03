@@ -13,6 +13,11 @@ on:
         required: true
         type: boolean
         default: true
+      dry_run:
+        description: 'Dry run (printed only, no Telegram)'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   test_pipeline:
@@ -39,9 +44,15 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           TWITTER_AUTH_TOKEN: ${{ secrets.TWITTER_AUTH_TOKEN }}
           TWITTER_CSRF_TOKEN: ${{ secrets.TWITTER_CSRF_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWITTERAPI_IO_KEY: ${{ secrets.TWITTERAPI_IO_KEY }}
         run: |
           # Build args based on workflow inputs
-          ARGS="--dry-run"
+          ARGS=""
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then
+            ARGS="$ARGS --dry-run"
+          fi
           if [[ "${{ github.event.inputs.run_digest }}" == "false" ]]; then
             ARGS="$ARGS --only-radar"
           fi
