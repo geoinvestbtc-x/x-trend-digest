@@ -1,0 +1,60 @@
+name: Digest Pipeline (Dry Run)
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_digest:
+        description: 'Run category digests'
+        required: true
+        type: boolean
+        default: true
+      run_radar:
+        description: 'Run Business Idea Radar'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  test_pipeline:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          
+      - name: Run Pipeline (Dry Run)
+        env:
+          # Secrets required for the fetchers and LLM to work during dry-run
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TWITTER_AUTH_TOKEN: ${{ secrets.TWITTER_AUTH_TOKEN }}
+          TWITTER_CSRF_TOKEN: ${{ secrets.TWITTER_CSRF_TOKEN }}
+        run: |
+          # Build args based on workflow inputs
+          ARGS="--dry-run"
+          if [[ "${{ github.event.inputs.run_digest }}" == "false" ]]; then
+            ARGS="$ARGS --only-radar"
+          fi
+          if [[ "${{ github.event.inputs.run_radar }}" == "false" ]]; then
+            ARGS="$ARGS --only-digest"
+          fi
+          
+          # If it's a pull request, run everything as a dry run to verify the scripts don't crash
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            python scripts/digest/run_daily.py --dry-run
+          else
+            python scripts/digest/run_daily.py $ARGS
+          fi
