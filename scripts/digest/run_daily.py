@@ -74,8 +74,13 @@ CATEGORIES = [
 MIN_POSTS_TO_SEND = 3
 MAX_POSTS_TO_SEND = 10
 
+def _print_banner(text: str, char="═", width=60):
+    print(f"\n{char * width}")
+    print(f"{text.center(width)}")
+    print(f"{char * width}\n")
 
-def _merge_and_rank(all_by_cat: list[dict[str, list[dict]]]) -> dict[str, list[dict]]:
+def _print_dry_run_msg(msg: str):
+    print(f"DEBUG: [DRY-RUN] {msg}")
     """Merge results from all sources, dedup by URL, rank by engagement."""
     merged: dict[str, list[dict]] = defaultdict(list)
     seen_per_cat: dict[str, set] = defaultdict(set)
@@ -138,9 +143,12 @@ def run_category_digests(dry_run: bool = False):
             posts = []
 
         if dry_run:
-            print(f"[dry-run] {cat} final selection ({len(posts)} posts):\n")
-            print(format_category_message(cat, posts, max_posts=MAX_POSTS_TO_SEND))
-            print("-" * 50)
+            _print_banner(f"DRY RUN: {emoji} {cat}", char="─")
+            rendered = format_category_message(cat, posts, max_posts=MAX_POSTS_TO_SEND)
+            # Indent for better readability
+            for line in rendered.splitlines():
+                print(f"  {line}")
+            print("\n" + "·" * 40)
         else:
             if send_category(cat, posts, min_posts=MIN_POSTS_TO_SEND, max_posts=MAX_POSTS_TO_SEND):
                 time.sleep(1)  # small delay between category messages
@@ -198,9 +206,16 @@ def run_idea_radar(dry_run: bool = False):
             publish.save_payload(final_ideas)
             publish.publish_to_telegram(final_ideas)  # Don't pass token_usage so it doesn't send its own msg
         else:
+            _print_banner("DRY RUN: BUSINESS IDEA RADAR", char="★")
             for i, idea in enumerate(final_ideas, 1):
-                print(f"  {i}. [{idea.get('rating')}] {idea.get('idea_title')}")
-                print(f"     {idea.get('problem_description', '')[:100]}")
+                title = idea.get('idea_title', 'Untitled')
+                score = idea.get('rating', 0)
+                print(f" {i}. [{score}/100] 🔥 {title}")
+                print(f"    Problem: {idea.get('problem_description', '')[:200]}...")
+                print(f"    Solution: {idea.get('proposed_solution', '')[:200]}...")
+                print(f"    ICP: {idea.get('icp', '')}")
+                print(f"    Sources: {idea.get('sources', '')}")
+                print(f"    " + "-" * 30)
                 
         p_tokens = token_usage.get('prompt_tokens', 0)
         c_tokens = token_usage.get('completion_tokens', 0)
@@ -239,8 +254,17 @@ def main():
     # gemini-3-flash-preview pricing via OpenRouter: ~$0.075/1M input, ~$0.30/1M output
     cost = (total_prompt_tokens * 0.075 / 1_000_000) + (total_completion_tokens * 0.3 / 1_000_000)
     
-    print(f"\n[pipeline] Total Pipeline LLM usage: {total_prompt_tokens} prompt + {total_completion_tokens} completion = {total_tok} tokens.")
-    print(f"[pipeline] Total Pipeline Estimated cost: ${cost:.6f}")
+    if args.dry_run:
+        _print_banner("TOTAL PIPELINE SUMMARY (DRY RUN)", char="█")
+        print(f"  Tokens Used: {total_tok:,}")
+        print(f"  - Prompt:    {total_prompt_tokens:,}")
+        print(f"  - Completion: {total_completion_tokens:,}")
+        print(f"  Estimated Cost: ${cost:.6f}")
+        print(f"  Pipelines run: {'Digests ' if not args.only_radar else ''}{'Radar ' if not args.only_digest else ''}")
+        print("█" * 60 + "\n")
+    else:
+        print(f"\n[pipeline] Total Pipeline LLM usage: {total_prompt_tokens} prompt + {total_completion_tokens} completion = {total_tok} tokens.")
+        print(f"[pipeline] Total Pipeline Estimated cost: ${cost:.6f}")
 
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id   = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHANNEL")
