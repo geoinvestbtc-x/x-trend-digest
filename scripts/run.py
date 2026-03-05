@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -58,6 +59,8 @@ def main():
                         help='Run full pipeline (discover→rank→summarize) but skip Telegram send and memory writes')
     parser.add_argument('--no-reddit', action='store_true',
                         help='Skip Reddit discovery even if REDDIT_DISCOVER_ENABLED=1')
+    parser.add_argument('--with-radar', action='store_true',
+                        help='Include Business Idea Radar pipeline')
     args = parser.parse_args()
     dry_run = args.dry_run
     skip_reddit = args.no_reddit
@@ -67,6 +70,30 @@ def main():
     day = datetime.now(timezone.utc).strftime('%Y%m%d')
     picks_n = int(os.getenv('DIGEST_MAX_PER_TOPIC', '5'))
     memory_days = int(os.getenv('TREND_MEMORY_DAYS', '30'))
+
+    # ── LLM usage accumulation ──
+    total_usage = {
+        'prompt_tokens': 0,
+        'completion_tokens': 0,
+        'reasoning_tokens': 0,
+        'llm_calls': 0,
+        'total_tokens': 0,
+        'cost_usd': 0.0
+    }
+
+    def add_to_total_usage(stats):
+        if not stats: return
+        total_usage['prompt_tokens'] += stats.get('prompt_tokens', 0)
+        total_usage['completion_tokens'] += stats.get('completion_tokens', 0)
+        total_usage['reasoning_tokens'] += stats.get('reasoning_tokens', 0)
+        total_usage['llm_calls'] += stats.get('llm_calls', 0) or (1 if stats.get('prompt_tokens') else 0)
+        # Recalculate total and cost to avoid discrepancies between modules
+        # Using gpt-4o-mini rates from summarize.py (approximate for Gemini)
+        _PRICE_INPUT = 0.15
+        _PRICE_OUTPUT = 0.60
+        total_usage['total_tokens'] = total_usage['prompt_tokens'] + total_usage['completion_tokens']
+        total_usage['cost_usd'] = (total_usage['prompt_tokens'] * _PRICE_INPUT / 1_000_000) + \
+                                 (total_usage['completion_tokens'] * _PRICE_OUTPUT / 1_000_000)
 
     # ── funnel counters per category ──
     funnel = defaultdict(lambda: {
@@ -99,6 +126,7 @@ def main():
     print(f"  TELEGRAM_TOKEN : {_mask(os.getenv('TELEGRAM_BOT_TOKEN', ''))}")
     reddit_enabled = os.getenv('REDDIT_DISCOVER_ENABLED', '0') == '1' and not skip_reddit
     print(f"  REDDIT         : {'enabled' if reddit_enabled else 'disabled (set REDDIT_DISCOVER_ENABLED=1 to enable)'}")
+    print(f"  IDEA RADAR     : {'enabled' if args.with_radar else 'disabled (pass --with-radar to enable)'}")
     print(f"{'='*60}\n")
 
     # ══════════════════════════════════════════════════════════
@@ -241,16 +269,16 @@ def main():
     # STAGE 4: SUMMARIZE / LLM (logging inside summarize.py)
     # ══════════════════════════════════════════════════════════
     picks = []
-    usage_stats = {}
     if ranked:
         print(f"{'='*60}")
         print(f"[STAGE 4] SUMMARIZE / LLM")
         print(f"{'='*60}")
-        picks, usage_stats = summarize_run(ranked, picks_n=picks_n)
+        picks, twitter_usage_stats = summarize_run(ranked, picks_n=picks_n)
+        add_to_total_usage(twitter_usage_stats)
         for p in picks:
             funnel[p.get('category', '?')]['picks'] += 1
         print(f"  total picks: {len(picks)}")
-        print(f"  LLM usage: {usage_stats}")
+        print(f"  LLM usage: {twitter_usage_stats}")
         print(f"{'='*60}\n")
     else:
         print(f"[STAGE 4] SKIPPED — no ranked candidates\n")
@@ -366,6 +394,7 @@ def main():
 
             if r_ranked:
                 reddit_picks, reddit_usage_stats = summarize_run(r_ranked, picks_n=picks_n)
+                add_to_total_usage(reddit_usage_stats)
                 print(f"  Reddit picks: {len(reddit_picks)}")
                 print(f"  Reddit LLM: {reddit_usage_stats}")
 
@@ -398,6 +427,59 @@ def main():
             traceback.print_exc()
 
         print(f"{'='*60}\n")
+
+    # ══════════════════════════════════════════════════════════
+    # STAGE 5c: BUSINESS IDEA RADAR (optional)
+    # ══════════════════════════════════════════════════════════
+    radar_ideas = []
+    if args.with_radar:
+        print(f"{'='*60}")
+        print(f"[STAGE 5c] BUSINESS IDEA RADAR")
+        print(f"{'='*60}")
+        try:
+            # Add radar directory to sys.path
+            radar_path = ROOT / 'scripts' / 'radar'
+            if str(radar_path) not in sys.path:
+                sys.path.insert(0, str(radar_path))
+            
+            import collect
+            import process
+            import memory as radar_memory
+            from config import config as radar_config
+
+            raw_items = collect.run_collection()
+            if not raw_items:
+                 print("[radar] No items collected.")
+            else:
+                generated_ideas, radar_usage = process.process_items(raw_items)
+                add_to_total_usage(radar_usage)
+                
+                if generated_ideas:
+                    radar_memory.cleanup()
+                    pool = []
+                    for idea in generated_ideas:
+                        processed_idea = radar_memory.match_and_merge(idea)
+                        st = processed_idea.get('status', 'new')
+                        if st in ['new', 'growing', 'reframed']:
+                            pool.append(processed_idea)
+                    
+                    pool.sort(key=lambda x: x.get('rating', 0), reverse=True)
+                    radar_ideas = pool[:radar_config.IDEA_MAX_PER_DAY]
+                    print(f"[radar] Generated {len(radar_ideas)} ideas.")
+
+                    if not dry_run:
+                        import publish as radar_publish
+                        radar_publish.save_payload(radar_ideas)
+                        radar_publish.publish_to_telegram(radar_ideas)
+                        print(f"  [radar] Published {len(radar_ideas)} ideas to Telegram.")
+                    else:
+                        print(f"  [radar] DRY RUN: Would publish {len(radar_ideas)} ideas.")
+                else:
+                    print("[radar] No ideas generated.")
+        except Exception as e:
+            import traceback
+            print(f"  [Radar] ❌ Pipeline error: {e}")
+            traceback.print_exc()
 
     # ══════════════════════════════════════════════════════════
     # STAGE 6: PUBLISH
@@ -484,35 +566,37 @@ def main():
         f"after_dedup={totals['after_dedup']} after_rank={totals['after_rank']} "
         f"picks={totals['picks']} msgs={len(messages)} sent={sent_count}"
     )
-    if usage_stats:
+    if total_usage['llm_calls'] > 0:
         print(
             f"[ai-digest][summary] LLM: "
-            f"calls={usage_stats.get('llm_calls', 0)} "
-            f"prompt={usage_stats.get('prompt_tokens', 0):,} "
-            f"completion={usage_stats.get('completion_tokens', 0):,} "
-            f"(reasoning={usage_stats.get('reasoning_tokens', 0):,}) "
-            f"total={usage_stats.get('total_tokens', 0):,} "
-            f"cost=${usage_stats.get('cost_usd', 0):.4f}"
+            f"calls={total_usage.get('llm_calls', 0)} "
+            f"prompt={total_usage.get('prompt_tokens', 0):,} "
+            f"completion={total_usage.get('completion_tokens', 0):,} "
+            f"(reasoning={total_usage.get('reasoning_tokens', 0):,}) "
+            f"total={total_usage.get('total_tokens', 0):,} "
+            f"cost=${total_usage.get('cost_usd', 0):.4f}"
         )
     print(f"{'='*60}\n")
 
     # ══════════════════════════════════════════════════════════
     # STAGE 7: PIPELINE SUMMARY → Telegram
     # ══════════════════════════════════════════════════════════
-    if not dry_run and os.getenv('SEND_TELEGRAM', '0') == '1' and os.getenv('TELEGRAM_CHAT_ID') and sent_count > 0:
-        cost = usage_stats.get('cost_usd', 0)
-        total_tok = usage_stats.get('total_tokens', 0)
-        llm_calls = usage_stats.get('llm_calls', 0)
+    if not dry_run and os.getenv('SEND_TELEGRAM', '0') == '1' and os.getenv('TELEGRAM_CHAT_ID') and (sent_count > 0 or (args.with_radar and radar_ideas)):
+        cost = total_usage.get('cost_usd', 0)
+        total_tok = total_usage.get('total_tokens', 0)
+        llm_calls = total_usage.get('llm_calls', 0)
         reasoning_pct = 0
-        if usage_stats.get('completion_tokens', 0) > 0:
-            reasoning_pct = int(usage_stats.get('reasoning_tokens', 0) / usage_stats['completion_tokens'] * 100)
+        if total_usage.get('completion_tokens', 0) > 0:
+            reasoning_pct = int(total_usage.get('reasoning_tokens', 0) / total_usage['completion_tokens'] * 100)
 
         reddit_line = f"🟠 Reddit: {len(reddit_picks)} picks\n" if reddit_picks else ""
+        radar_line = f"💡 Radar: {len(radar_ideas)} ideas\n" if radar_ideas else ""
         summary_text = (
             f"✅ <b>Pipeline complete</b>\n"
             f"\n"
             f"𝕏 {totals['discovered']} discovered → {totals['after_rank']} ranked → {totals['picks']} picks\n"
             f"{reddit_line}"
+            f"{radar_line}"
             f"📨 {sent_count} messages sent\n"
             f"🤖 {llm_calls} LLM calls · {total_tok:,} tokens (reasoning {reasoning_pct}%)\n"
             f"💰 ${cost:.4f}"
@@ -533,10 +617,11 @@ def main():
             'fresh_after_ttl': len(fresh),
             'ranked': len(ranked),
             'picks': len(picks),
+            'radar_ideas': len(radar_ideas),
             'messages': len(messages),
             'telegram_sent': sent_count,
         },
-        'usage': usage_stats,
+        'usage': total_usage,
         'errors': [{'category': b.get('category'), 'error': b.get('error')} for b in discovered_blocks if b.get('error')],
         'files': {
             'payload': str(payload_path),
